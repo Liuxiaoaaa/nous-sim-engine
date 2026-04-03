@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nous-sim-engine"
+version = "0.1.0"
+description = "Standalone PDM scoring engine for RL trajectory evaluation"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.24", "scipy>=1.10", "shapely>=2.0"]
+
+[project.optional-dependencies]
+server = ["fastapi>=0.100", "uvicorn[standard]>=0.20"]
+navsim = ["navsim"]  # full navsim for official PDM computation
