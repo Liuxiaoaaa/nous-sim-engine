@@ -33,7 +33,8 @@ class SceneContext:
     centerline: "PDMPath"
     collided_track_ids: Set[str] = field(default_factory=set)
     gt_trajectory: Optional[np.ndarray] = None  # (T, 2) ego-relative GT xy waypoints
-    gt_progress: Optional[float] = None  # precomputed GT centerline progress
+    gt_progress: Optional[float] = None  # precomputed GT centerline progress (raw)
+    gt_masked_progress: Optional[float] = None  # gt_progress × gt_NC × gt_DAC (for EP normalization)
     track_object_types: Dict[str, str] = field(default_factory=dict)  # token → "agent" | "static"
 
 
