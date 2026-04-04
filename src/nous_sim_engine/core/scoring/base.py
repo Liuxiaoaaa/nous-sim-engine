@@ -218,17 +218,49 @@ class ScorerBase:
         return np.concatenate([global_xy, headings[..., None]], axis=-1)
 
     def _build_proposals(
-        self, waypoints: np.ndarray, scene: SceneContext, input_interval: float = 0.5,
+        self,
+        waypoints: np.ndarray,
+        scene: SceneContext,
+        input_interval: float = 0.5,
+        *,
+        include_ego: bool = True,
     ) -> np.ndarray:
+        """Convert ego-relative waypoints to global proposals with interpolation.
+
+        Args:
+            include_ego: If True, prepend ego pose as t=0. Pred trajectories
+                (no ego) should use True. GT trajectories (already contain ego)
+                should use False.
+        Returns:
+            (B, 41, 3) if include_ego=True, (B, 40, 3) if False.
+        """
         ego_state = scene.ego_state
         global_coarse = self._ego_to_global(waypoints, ego_state)
 
         sim_dt = float(scene.observation.interval_time)
         if sim_dt <= 0 or abs(input_interval - sim_dt) < 1e-6:
+            if include_ego:
+                ego_pose = np.array(
+                    [ego_state[StateIndex.X], ego_state[StateIndex.Y], ego_state[StateIndex.HEADING]],
+                    dtype=np.float64,
+                )
+                batch_size = global_coarse.shape[0]
+                return np.concatenate(
+                    [np.broadcast_to(ego_pose, (batch_size, 1, 3)), global_coarse], axis=1,
+                )
             return global_coarse
 
         ratio = round(input_interval / sim_dt)
         if ratio <= 1:
+            if include_ego:
+                ego_pose = np.array(
+                    [ego_state[StateIndex.X], ego_state[StateIndex.Y], ego_state[StateIndex.HEADING]],
+                    dtype=np.float64,
+                )
+                batch_size = global_coarse.shape[0]
+                return np.concatenate(
+                    [np.broadcast_to(ego_pose, (batch_size, 1, 3)), global_coarse], axis=1,
+                )
             return global_coarse
 
         batch_size, num_coarse, _ = global_coarse.shape
@@ -265,7 +297,11 @@ class ScorerBase:
         proposals = np.zeros((batch_size, num_fine, 3), dtype=np.float64)
         proposals[..., :2] = fine_xy
         proposals[..., 2] = normalize_angle(fine_heading)
-        return proposals[:, 1:, :]
+
+        if include_ego:
+            return proposals  # (B, 41, 3) with ego at t=0
+        else:
+            return proposals[:, 1:, :]  # (B, 40, 3) without ego
 
     def _waypoints_to_proposals(self, waypoints_xy: np.ndarray, ego_state: np.ndarray) -> np.ndarray:
         return self._ego_to_global(waypoints_xy, ego_state)

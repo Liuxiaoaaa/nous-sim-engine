@@ -48,28 +48,17 @@ class PDMSimulator:
             raise ValueError(f"observation interval_time must be positive, got {interval_time}")
         return interval_time
 
-    def _prepare_reference_trajectory(
-        self,
-        ego_state: np.ndarray,
-        proposals: np.ndarray,
-    ) -> np.ndarray:
-        ego_pose = self._extract_pose(ego_state)
-        first_pose = proposals[:, 0, :]
-
-        if np.allclose(first_pose, ego_pose[None, :], atol=1e-6, rtol=1e-6):
-            return proposals
-
-        return np.concatenate(
-            [np.repeat(ego_pose[None, None, :], proposals.shape[0], axis=0), proposals],
-            axis=1,
-        )
-
     def simulate_proposals(
         self,
         ego_state: np.ndarray,
         proposals: np.ndarray,
         observation: "PDMObservation" | None = None,
     ) -> np.ndarray:
+        """Simulate proposals. Expects proposals to include t=0 ego pose.
+
+        Input: proposals (B, T, 3) where T should be num_poses+1 (e.g. 41 for 4s @ 0.1s).
+        Output: simulated_states (B, T, 11).
+        """
         ego_state = np.asarray(ego_state, dtype=np.float64)
         proposals = np.asarray(proposals, dtype=np.float64)
 
@@ -83,12 +72,12 @@ class PDMSimulator:
         dt = self._resolve_dt(observation)
         self._tracker.discretization_time = dt
 
-        reference_trajectory = self._prepare_reference_trajectory(ego_state, proposals)
-        batch_size, num_steps, _ = reference_trajectory.shape
+        # Proposals already include t=0 ego pose — use directly as reference.
+        batch_size, num_steps, _ = proposals.shape
 
         simulated_states = np.zeros((batch_size, num_steps, StateIndex.size()), dtype=np.float64)
         simulated_states[:, 0, :] = ego_state[None, :]
-        self._tracker.update(reference_trajectory)
+        self._tracker.update(proposals)
 
         for time_idx in range(num_steps - 1):
             accelerations, steering_rates = self._tracker.track_trajectory(

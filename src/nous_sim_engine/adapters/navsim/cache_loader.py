@@ -228,11 +228,11 @@ def _extract_gt_trajectory_xy(
     metric_cache: Any, ego_state_array: np.ndarray,
     num_future_steps: int = 40,
 ) -> np.ndarray | None:
-    """Extract GT future trajectory as ego-relative (x, y) waypoints at 0.1s resolution.
+    """Extract GT trajectory as ego-relative (x, y) waypoints at 0.1s resolution.
 
     MetricCache.trajectory is an InterpolatedTrajectory sampled at 0.1s.
-    We take sampled[1:num_future_steps+1] (skip t=0, keep 40 pts = 4s @ 0.1s).
-    This matches the simulator's 0.1s resolution directly — no interpolation needed.
+    We take sampled[0:num_future_steps+1] (include t=0, keep 41 pts = ego + 4s @ 0.1s).
+    The t=0 point becomes [0, 0] in ego-relative coordinates.
     """
     trajectory = getattr(metric_cache, "trajectory", None)
     if trajectory is None:
@@ -244,10 +244,10 @@ def _extract_gt_trajectory_xy(
     if len(sampled) < 2:
         return None
 
-    # Take sampled[1:41] — skip t=0, keep up to 40 future steps @ 0.1s
+    # Take sampled[0:41] — include t=0 (ego pose), keep up to 41 steps @ 0.1s
     end_idx = min(num_future_steps + 1, len(sampled))
     global_xy = np.array(
-        [[s.rear_axle.x, s.rear_axle.y] for s in sampled[1:end_idx]],
+        [[s.rear_axle.x, s.rear_axle.y] for s in sampled[0:end_idx]],
         dtype=np.float64,
     )
 
@@ -264,7 +264,7 @@ def _extract_gt_trajectory_xy(
     local_x = dx * cos_h - dy * sin_h
     local_y = dx * sin_h + dy * cos_h
 
-    return np.stack([local_x, local_y], axis=1)  # (<=40, 2)
+    return np.stack([local_x, local_y], axis=1)  # (<=41, 2) with t=0 ≈ [0, 0]
 
 
 _AGENT_TYPE_NAMES = {"VEHICLE", "PEDESTRIAN", "BICYCLE", "EGO"}
