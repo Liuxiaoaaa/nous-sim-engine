@@ -13,6 +13,7 @@ class ScoreRequest(BaseModel):
     log_name: str
     dataset: str
     scoring_version: str = "v1"
+    include_ego: bool = False
 
 
 class BatchScoreRequest(BaseModel):
@@ -21,6 +22,7 @@ class BatchScoreRequest(BaseModel):
     log_name: str
     dataset: str
     scoring_version: str = "v1"
+    include_ego: bool = False
 
 
 class ScoreResponse(BaseModel):
@@ -89,6 +91,7 @@ class RLScoreRequest(BaseModel):
     dataset: str
     scoring_mode: Literal["continuous", "discrete"] = "continuous"
     config_overrides: Optional[RLConfigOverrides] = None
+    include_ego: bool = False
 
 
 class BatchRLScoreRequest(BaseModel):
@@ -98,6 +101,7 @@ class BatchRLScoreRequest(BaseModel):
     dataset: str
     scoring_mode: Literal["continuous", "discrete"] = "continuous"
     config_overrides: Optional[RLConfigOverrides] = None
+    include_ego: bool = False
 
 
 class RLScoreResponse(BaseModel):

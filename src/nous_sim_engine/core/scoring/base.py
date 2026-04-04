@@ -223,23 +223,23 @@ class ScorerBase:
         scene: SceneContext,
         input_interval: float = 0.5,
         *,
-        include_ego: bool = True,
+        include_ego: bool = False,
     ) -> np.ndarray:
         """Convert ego-relative waypoints to global proposals with interpolation.
 
         Args:
-            include_ego: If True, prepend ego pose as t=0. Pred trajectories
-                (no ego) should use True. GT trajectories (already contain ego)
-                should use False.
+            include_ego: Whether the input waypoints already contain ego pose
+                as the first point. If False (default), ego pose is prepended.
         Returns:
-            (B, 41, 3) if include_ego=True, (B, 40, 3) if False.
+            (B, 41, 3) global proposals including ego at t=0.
         """
         ego_state = scene.ego_state
         global_coarse = self._ego_to_global(waypoints, ego_state)
+        need_prepend = not include_ego
 
         sim_dt = float(scene.observation.interval_time)
         if sim_dt <= 0 or abs(input_interval - sim_dt) < 1e-6:
-            if include_ego:
+            if need_prepend:
                 ego_pose = np.array(
                     [ego_state[StateIndex.X], ego_state[StateIndex.Y], ego_state[StateIndex.HEADING]],
                     dtype=np.float64,
@@ -252,7 +252,7 @@ class ScorerBase:
 
         ratio = round(input_interval / sim_dt)
         if ratio <= 1:
-            if include_ego:
+            if need_prepend:
                 ego_pose = np.array(
                     [ego_state[StateIndex.X], ego_state[StateIndex.Y], ego_state[StateIndex.HEADING]],
                     dtype=np.float64,
@@ -297,11 +297,7 @@ class ScorerBase:
         proposals = np.zeros((batch_size, num_fine, 3), dtype=np.float64)
         proposals[..., :2] = fine_xy
         proposals[..., 2] = normalize_angle(fine_heading)
-
-        if include_ego:
-            return proposals  # (B, 41, 3) with ego at t=0
-        else:
-            return proposals[:, 1:, :]  # (B, 40, 3) without ego
+        return proposals  # (B, 41, 3) always includes ego at t=0
 
     def _waypoints_to_proposals(self, waypoints_xy: np.ndarray, ego_state: np.ndarray) -> np.ndarray:
         return self._ego_to_global(waypoints_xy, ego_state)

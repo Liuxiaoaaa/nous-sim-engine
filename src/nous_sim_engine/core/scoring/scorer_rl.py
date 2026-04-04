@@ -57,11 +57,13 @@ class RLScorer(ScorerBase):
         trajectories_xy: np.ndarray,
         scene: SceneContext,
         rl_config: RLScorerConfig | None = None,
+        *,
+        include_ego: bool = False,
     ) -> List[RLScoringResult]:
         rl_config = rl_config or RLScorerConfig.v1()
 
         batch_waypoints = self._coerce_trajectories(trajectories_xy)
-        proposals = self._build_proposals(batch_waypoints, scene)
+        proposals = self._build_proposals(batch_waypoints, scene, include_ego=include_ego)
         simulated_states = self._simulator.simulate_proposals(
             ego_state=scene.ego_state, proposals=proposals, observation=scene.observation,
         )

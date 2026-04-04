@@ -105,6 +105,7 @@ def _score_batch(
     log_name: str,
     metric_cache_dir: str,
     scoring_version: str = "v1",
+    include_ego: bool = False,
     scorer_v1: PDMScorerV1 | None = None,
     scorer_v2: PDMScorerV2 | None = None,
 ) -> BatchScoreResponse:
@@ -117,10 +118,10 @@ def _score_batch(
         )
         if scoring_version == "v2":
             scorer = scorer_v2 or PDMScorerV2()
-            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene)
+            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene, include_ego=include_ego)
         else:
             scorer = scorer_v1 or PDMScorerV1()
-            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene)
+            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene, include_ego=include_ego)
         return BatchScoreResponse(results=[_result_to_response(r) for r in results])
     except Exception as exc:
         return _error_results(str(exc), batch_size=len(batch_trajectories))
@@ -132,6 +133,7 @@ def _score_batch_rl(
     log_name: str,
     metric_cache_dir: str,
     rl_config: RLScorerConfig,
+    include_ego: bool = False,
     scorer_rl: RLScorer | None = None,
 ) -> BatchRLScoreResponse:
     batch_trajectories = list(trajectories)
@@ -143,7 +145,7 @@ def _score_batch_rl(
         )
         scorer = scorer_rl or RLScorer()
         results = scorer.score_batch(
-            trajectories_xy=batch_trajectories, scene=scene, rl_config=rl_config,
+            trajectories_xy=batch_trajectories, scene=scene, rl_config=rl_config, include_ego=include_ego,
         )
         return BatchRLScoreResponse(results=[_rl_result_to_response(r) for r in results])
     except Exception as exc:
@@ -220,6 +222,7 @@ def create_app() -> FastAPI:
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             scoring_version=payload.scoring_version,
+            include_ego=payload.include_ego,
             scorer_v1=request.app.state.scorer_v1,
             scorer_v2=request.app.state.scorer_v2,
         )
@@ -233,6 +236,7 @@ def create_app() -> FastAPI:
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             scoring_version=payload.scoring_version,
+            include_ego=payload.include_ego,
             scorer_v1=request.app.state.scorer_v1,
             scorer_v2=request.app.state.scorer_v2,
         )
@@ -250,6 +254,7 @@ def create_app() -> FastAPI:
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             rl_config=rl_config,
+            include_ego=payload.include_ego,
             scorer_rl=request.app.state.scorer_rl,
         )
 
@@ -263,6 +268,7 @@ def create_app() -> FastAPI:
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             rl_config=rl_config,
+            include_ego=payload.include_ego,
             scorer_rl=request.app.state.scorer_rl,
         )
         return batch_response.results[0]
