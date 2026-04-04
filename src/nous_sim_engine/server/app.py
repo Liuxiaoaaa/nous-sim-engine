@@ -16,7 +16,8 @@ from nous_sim_engine.adapters.navsim.cache_loader import (
     set_boost_cache_dir,
     warmup_boost_cache,
 )
-from nous_sim_engine.core.scorer import PDMScorer, PDMScorerConfig, RLScorerConfig
+from nous_sim_engine.core.scoring import PDMScorerV1, PDMScorerV2, RLScorer
+from nous_sim_engine.core.scoring.base import PDMScorerConfig, RLScorerConfig
 from nous_sim_engine.core.types import RLScoringResult, ScoringResult
 
 from .registry import DatasetRegistry
@@ -98,13 +99,14 @@ def _resolve_dataset(registry: DatasetRegistry, dataset: str) -> str:
         )
 
 
-def _score_batch_results(
-    scorer: PDMScorer,
+def _score_batch(
     trajectories: Sequence[Sequence[Sequence[float]]],
     scene_token: str,
     log_name: str,
     metric_cache_dir: str,
     scoring_version: str = "v1",
+    scorer_v1: PDMScorerV1 | None = None,
+    scorer_v2: PDMScorerV2 | None = None,
 ) -> BatchScoreResponse:
     batch_trajectories = list(trajectories)
     try:
@@ -113,21 +115,24 @@ def _score_batch_results(
             log_name=log_name,
             token=scene_token,
         )
-        config = PDMScorerConfig.v1() if scoring_version == "v1" else PDMScorerConfig.v2()
-        scorer = PDMScorer(config=config)
-        results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene)
-        return BatchScoreResponse(results=[_result_to_response(result) for result in results])
+        if scoring_version == "v2":
+            scorer = scorer_v2 or PDMScorerV2()
+            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene)
+        else:
+            scorer = scorer_v1 or PDMScorerV1()
+            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene)
+        return BatchScoreResponse(results=[_result_to_response(r) for r in results])
     except Exception as exc:
         return _error_results(str(exc), batch_size=len(batch_trajectories))
 
 
-def _score_batch_rl_results(
-    scorer: PDMScorer,
+def _score_batch_rl(
     trajectories: Sequence[Sequence[Sequence[float]]],
     scene_token: str,
     log_name: str,
     metric_cache_dir: str,
     rl_config: RLScorerConfig,
+    scorer_rl: RLScorer | None = None,
 ) -> BatchRLScoreResponse:
     batch_trajectories = list(trajectories)
     try:
@@ -136,10 +141,9 @@ def _score_batch_rl_results(
             log_name=log_name,
             token=scene_token,
         )
-        results = scorer.score_batch_for_rl(
-            trajectories_xy=batch_trajectories,
-            scene=scene,
-            rl_config=rl_config,
+        scorer = scorer_rl or RLScorer()
+        results = scorer.score_batch(
+            trajectories_xy=batch_trajectories, scene=scene, rl_config=rl_config,
         )
         return BatchRLScoreResponse(results=[_rl_result_to_response(r) for r in results])
     except Exception as exc:
@@ -171,7 +175,10 @@ def _init_registry() -> DatasetRegistry:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    app.state.scorer = PDMScorer()
+    # Pre-create scorer instances (shared across requests)
+    app.state.scorer_v1 = PDMScorerV1()
+    app.state.scorer_v2 = PDMScorerV2()
+    app.state.scorer_rl = RLScorer()
     app.state.registry = _init_registry()
 
     # Boost cache: background warmup if configured
@@ -183,7 +190,6 @@ async def _lifespan(app: FastAPI):
         set_boost_cache_dir(boost_dir)
         logger.info("Boost cache enabled: %s", boost_dir)
 
-        # Warmup from all registered datasets (not just legacy SIM_ENGINE_METRIC_CACHE_DIR)
         source_dirs = list(app.state.registry.list_all().values())
         if source_dir and source_dir not in source_dirs:
             source_dirs.append(source_dir)
@@ -208,25 +214,27 @@ def create_app() -> FastAPI:
     @app.post("/v1/score/batch", response_model=BatchScoreResponse)
     def score_batch(payload: BatchScoreRequest, request: Request) -> BatchScoreResponse:
         cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
-        return _score_batch_results(
-            scorer=request.app.state.scorer,
+        return _score_batch(
             trajectories=payload.trajectories,
             scene_token=payload.scene_token,
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             scoring_version=payload.scoring_version,
+            scorer_v1=request.app.state.scorer_v1,
+            scorer_v2=request.app.state.scorer_v2,
         )
 
     @app.post("/v1/score", response_model=ScoreResponse)
     def score(payload: ScoreRequest, request: Request) -> ScoreResponse:
         cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
-        batch_response = _score_batch_results(
-            scorer=request.app.state.scorer,
+        batch_response = _score_batch(
             trajectories=[payload.trajectory],
             scene_token=payload.scene_token,
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             scoring_version=payload.scoring_version,
+            scorer_v1=request.app.state.scorer_v1,
+            scorer_v2=request.app.state.scorer_v2,
         )
         return batch_response.results[0]
 
@@ -236,26 +244,26 @@ def create_app() -> FastAPI:
     def score_rl_batch(payload: BatchRLScoreRequest, request: Request) -> BatchRLScoreResponse:
         cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
         rl_config = _build_rl_config(payload.scoring_mode, payload.config_overrides)
-        return _score_batch_rl_results(
-            scorer=request.app.state.scorer,
+        return _score_batch_rl(
             trajectories=payload.trajectories,
             scene_token=payload.scene_token,
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             rl_config=rl_config,
+            scorer_rl=request.app.state.scorer_rl,
         )
 
     @app.post("/v1/score/rl", response_model=RLScoreResponse)
     def score_rl(payload: RLScoreRequest, request: Request) -> RLScoreResponse:
         cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
         rl_config = _build_rl_config(payload.scoring_mode, payload.config_overrides)
-        batch_response = _score_batch_rl_results(
-            scorer=request.app.state.scorer,
+        batch_response = _score_batch_rl(
             trajectories=[payload.trajectory],
             scene_token=payload.scene_token,
             log_name=payload.log_name,
             metric_cache_dir=cache_dir,
             rl_config=rl_config,
+            scorer_rl=request.app.state.scorer_rl,
         )
         return batch_response.results[0]
 

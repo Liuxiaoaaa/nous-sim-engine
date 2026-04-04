@@ -15,7 +15,6 @@ import numpy as np
 from nous_sim_engine.core.geometry import PDMPath
 from nous_sim_engine.core.observation import PDMObservation
 from nous_sim_engine.core.occupancy import DrivableMap, OccupancyMap
-from nous_sim_engine.core.scorer import PDMScorer
 from nous_sim_engine.core.types import SceneContext
 
 logger = logging.getLogger(__name__)
@@ -278,7 +277,7 @@ def _extract_track_object_types(metric_cache: Any) -> dict[str, str]:
         tracked_objects = getattr(dt, "tracked_objects", None)
         if tracked_objects is None:
             continue
-        for obj in tracked_objects:
+        for obj in tracked_objects.tracked_objects:
             token = str(getattr(obj, "track_token", ""))
             if not token:
                 continue
@@ -290,10 +289,22 @@ def _extract_track_object_types(metric_cache: Any) -> dict[str, str]:
 
 def _attach_rl_precompute(ctx: SceneContext) -> None:
     """Populate optional RL continuous precomputed fields for both warm and lazy paths."""
-    if getattr(ctx, "gt_progress", None) is None and getattr(ctx, "gt_trajectory", None) is not None:
-        gt_result = PDMScorer()._simulate_and_score_gt(ctx)
-        if gt_result is not None:
+    if getattr(ctx, "gt_trajectory", None) is None:
+        return
+
+    gt_result = None
+    if getattr(ctx, "gt_progress", None) is None or getattr(ctx, "gt_masked_progress", None) is None:
+        from nous_sim_engine.core.scoring.base import ScorerBase
+        gt_result = ScorerBase()._simulate_and_score_gt(ctx)
+
+    if gt_result is not None:
+        if ctx.gt_progress is None:
             ctx.gt_progress = gt_result.progress
+        if getattr(ctx, "gt_masked_progress", None) is None:
+            from nous_sim_engine.core.enums import MultiMetricIndex
+            gt_nc = float(gt_result.multi_metrics[MultiMetricIndex.NO_COLLISION])
+            gt_dac = float(gt_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA])
+            ctx.gt_masked_progress = gt_result.progress * gt_nc * gt_dac
 
 
 def metric_cache_to_scene_context(metric_cache: MetricCache, scene_token: str) -> SceneContext:
