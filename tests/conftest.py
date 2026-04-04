@@ -127,17 +127,17 @@ def red_light_scene() -> SceneContext:
 
 @pytest.fixture
 def safe_trajectory() -> list[list[float]]:
-    """Trajectory going straight ahead ~25m in 5s — stays on road, avoids obstacle."""
-    return [[0.5 * t, 0.0] for t in range(1, 51)]
+    """8 waypoints going straight ahead ~20m in 4s — stays on road, avoids obstacle."""
+    return [[2.5 * t, 0.0] for t in range(1, 9)]
 
 
 @pytest.fixture
 def collision_trajectory() -> list[list[float]]:
-    """Trajectory that drives straight into the obstacle at x=30."""
-    return [[0.6 * t, 0.0] for t in range(1, 51)]
+    """8 waypoints that drive straight into the obstacle at x=30."""
+    return [[3.75 * t, 0.0] for t in range(1, 9)]
 
 
 @pytest.fixture
 def offroad_trajectory() -> list[list[float]]:
-    """Trajectory that veers off road (y >> road_half_width)."""
-    return [[0.5 * t, 0.2 * t] for t in range(1, 51)]
+    """8 waypoints that veer off road (y >> road_half_width=4)."""
+    return [[2.5 * t, 0.8 * t] for t in range(1, 9)]

@@ -21,7 +21,7 @@ from nous_sim_engine.server.app import create_app
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-METRIC_CACHE_DIR = "/fake/cache"
+DATASET = "test"
 LOG_NAME = "test_log"
 SCENE_TOKEN = "test_scene_001"
 
@@ -44,20 +44,22 @@ class _PatchedClient(SimEngineClient):
 
 @pytest.fixture
 def app_and_client(straight_road_scene):
-    """Create FastAPI app + TestClient with load_scene_context patched."""
+    """Create FastAPI app + TestClient with load_scene_context patched and test dataset registered."""
     with patch("nous_sim_engine.server.app.load_scene_context", return_value=straight_road_scene):
-        app = create_app()
-        with TestClient(app) as tc:
-            yield tc
+        with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+            app = create_app()
+            with TestClient(app) as tc:
+                yield tc
 
 
 @pytest.fixture
 def app_with_redlight(red_light_scene):
     """TestClient with a red-light scene."""
     with patch("nous_sim_engine.server.app.load_scene_context", return_value=red_light_scene):
-        app = create_app()
-        with TestClient(app) as tc:
-            yield tc
+        with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+            app = create_app()
+            with TestClient(app) as tc:
+                yield tc
 
 
 @pytest.fixture
@@ -101,7 +103,7 @@ class TestPDMScoring:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
         })
         assert resp.status_code == 200
         data = resp.json()
@@ -114,7 +116,7 @@ class TestPDMScoring:
             "trajectories": [safe_trajectory, offroad_trajectory],
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
         })
         assert resp.status_code == 200
         data = resp.json()
@@ -127,7 +129,7 @@ class TestPDMScoring:
             trajectory=safe_trajectory,
             scene_token=SCENE_TOKEN,
             log_name=LOG_NAME,
-            metric_cache_dir=METRIC_CACHE_DIR,
+            dataset=DATASET,
         )
         assert pdm_score > 0.0
         assert result["error"] is None
@@ -137,7 +139,7 @@ class TestPDMScoring:
             trajectories=[safe_trajectory, offroad_trajectory],
             scene_token=SCENE_TOKEN,
             log_name=LOG_NAME,
-            metric_cache_dir=METRIC_CACHE_DIR,
+            dataset=DATASET,
         )
         assert len(results) == 2
         assert results[0]["pdm_score"] >= results[1]["pdm_score"]
@@ -157,7 +159,7 @@ class TestRLScoring:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "continuous",
         })
         assert resp.status_code == 200
@@ -179,7 +181,7 @@ class TestRLScoring:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "discrete",
         })
         assert resp.status_code == 200
@@ -197,14 +199,14 @@ class TestRLScoring:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "continuous",
         })
         resp_disc = app_and_client.post("/v1/score/rl", json={
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "discrete",
         })
         cont = resp_cont.json()
@@ -222,7 +224,7 @@ class TestRLScoring:
             "trajectories": [safe_trajectory, offroad_trajectory],
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "continuous",
         })
         assert resp.status_code == 200
@@ -237,21 +239,21 @@ class TestRLScoring:
 
     # ── 3.5 Config overrides ─────────────────────────────────────────
 
-    def test_rl_score_with_config_overrides(self, app_and_client, safe_trajectory):
+    def test_rl_score_with_config_overrides(self, app_and_client, offroad_trajectory):
         # Score with default weights
         resp_default = app_and_client.post("/v1/score/rl", json={
-            "trajectory": safe_trajectory,
+            "trajectory": offroad_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "continuous",
         })
         # Score with heavily boosted ep_weight
         resp_custom = app_and_client.post("/v1/score/rl", json={
-            "trajectory": safe_trajectory,
+            "trajectory": offroad_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "continuous",
             "config_overrides": {"ep_weight": 100.0},
         })
@@ -272,7 +274,7 @@ class TestRLScoring:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "continuous",
         })
         data = resp.json()
@@ -286,7 +288,7 @@ class TestRLScoring:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "discrete",
         })
         data = resp.json()
@@ -304,7 +306,7 @@ class TestClientRL:
             trajectory=safe_trajectory,
             scene_token=SCENE_TOKEN,
             log_name=LOG_NAME,
-            metric_cache_dir=METRIC_CACHE_DIR,
+            dataset=DATASET,
             scoring_mode="continuous",
         )
         assert rl_score > 0.0
@@ -317,7 +319,7 @@ class TestClientRL:
             trajectory=safe_trajectory,
             scene_token=SCENE_TOKEN,
             log_name=LOG_NAME,
-            metric_cache_dir=METRIC_CACHE_DIR,
+            dataset=DATASET,
             scoring_mode="discrete",
         )
         assert rl_score > 0.0
@@ -328,7 +330,7 @@ class TestClientRL:
             trajectories=[safe_trajectory, offroad_trajectory],
             scene_token=SCENE_TOKEN,
             log_name=LOG_NAME,
-            metric_cache_dir=METRIC_CACHE_DIR,
+            dataset=DATASET,
             scoring_mode="continuous",
         )
         assert len(results) == 2
@@ -340,7 +342,7 @@ class TestClientRL:
             trajectory=safe_trajectory,
             scene_token=SCENE_TOKEN,
             log_name=LOG_NAME,
-            metric_cache_dir=METRIC_CACHE_DIR,
+            dataset=DATASET,
             scoring_mode="continuous",
             config_overrides={"nc_weight": 10.0, "ttc_horizon": 5.0},
         )
@@ -352,7 +354,7 @@ class TestClientRL:
             trajectory=safe_trajectory,
             scene_token=SCENE_TOKEN,
             log_name=LOG_NAME,
-            metric_cache_dir=METRIC_CACHE_DIR,
+            dataset=DATASET,
             scoring_mode="discrete",
         )
         assert result["traffic_light_compliance"] == 0.0
@@ -369,7 +371,7 @@ class TestSchemaValidation:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "invalid_mode",
         })
         assert resp.status_code == 422  # Pydantic validation error
@@ -387,7 +389,7 @@ class TestSchemaValidation:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             # No scoring_mode — should default to continuous
         })
         assert resp.status_code == 200
@@ -407,13 +409,13 @@ class TestDiscreteConsistency:
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
         })
         rl_resp = app_and_client.post("/v1/score/rl", json={
             "trajectory": safe_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "discrete",
         })
         pdm = pdm_resp.json()
@@ -435,13 +437,13 @@ class TestDiscreteConsistency:
             "trajectory": offroad_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
         })
         rl_resp = app_and_client.post("/v1/score/rl", json={
             "trajectory": offroad_trajectory,
             "scene_token": SCENE_TOKEN,
             "log_name": LOG_NAME,
-            "metric_cache_dir": METRIC_CACHE_DIR,
+            "dataset": DATASET,
             "scoring_mode": "discrete",
         })
         pdm = pdm_resp.json()

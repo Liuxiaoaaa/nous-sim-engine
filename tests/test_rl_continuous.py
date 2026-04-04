@@ -115,6 +115,7 @@ def _build_scene(
     )
     if gt_progress is not None:
         ctx.gt_progress = gt_progress
+        ctx.gt_masked_progress = gt_progress  # assume GT has no collision/offroad
     return ctx
 
 
