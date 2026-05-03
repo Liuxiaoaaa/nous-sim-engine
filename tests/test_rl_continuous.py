@@ -360,6 +360,32 @@ class TestPipelineAlignment:
             for key, val in result.sub_rewards().items():
                 assert 0.0 <= val <= 1.0, f"{key}={val} out of [0,1] for y={y}"
 
+    def test_grounding_fields_centered(self):
+        scene = _build_scene(no_obstacle=True)
+        result = _score_rl(scene, _straight(2.0, y=0.0))
+        assert abs(result.centerline_lateral_offset_start_signed) < 1e-6
+        assert abs(result.centerline_lateral_offset_end_signed) < 1e-6
+        assert result.centerline_distance_mean >= 0.0
+        assert result.centerline_distance_max >= result.centerline_distance_mean
+        assert 0.0 <= result.in_intersection_fraction <= 1.0
+        assert 0.0 <= result.oncoming_fraction <= 1.0
+        assert 0.0 <= result.non_drivable_fraction <= 1.0
+        assert 0.0 <= result.multiple_lanes_fraction <= 1.0
+
+    def test_grounding_fields_offset_sign(self):
+        scene = _build_scene(no_obstacle=True)
+        left = _score_rl(scene, _straight(2.0, y=1.0))
+        right = _score_rl(scene, _straight(2.0, y=-1.0))
+        assert left.centerline_lateral_offset_start_signed * right.centerline_lateral_offset_start_signed <= 0.0
+        assert left.centerline_lateral_offset_end_signed * right.centerline_lateral_offset_end_signed <= 0.0
+
+    def test_boundary_distance_ordering(self):
+        scene = _build_scene(road_half_width=4.0, no_obstacle=True)
+        centered = _score_rl(scene, _straight(2.0, y=0.0))
+        edge = _score_rl(scene, _straight(2.0, y=3.0))
+        assert centered.boundary_distance_min >= edge.boundary_distance_min
+
+
     def test_rl_score_is_soft_gated(self):
         """rl_score = (NC*DAC*DDC*TLC)^alpha × weighted_avg(EP, TTC, LK, HC)."""
         scene = _build_scene(no_obstacle=True)

@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Geometry helpers under NUPLAN ego-frame convention.
+
+The engine uses x-forward, y-left coordinates for ego-relative poses.
+"""
+
 from typing import Any
 
 import numpy as np

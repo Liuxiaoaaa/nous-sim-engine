@@ -22,10 +22,12 @@ from nous_sim_engine.core.types import RLScoringResult, ScoringResult
 
 from .registry import DatasetRegistry
 from .schemas import (
+    BatchControlScoreRequest,
     BatchRLScoreRequest,
     BatchRLScoreResponse,
     BatchScoreRequest,
     BatchScoreResponse,
+    ControlScoreRequest,
     DatasetListResponse,
     DatasetRegisterRequest,
     HealthResponse,
@@ -125,6 +127,31 @@ def _score_batch(
         return BatchScoreResponse(results=[_result_to_response(r) for r in results])
     except Exception as exc:
         return _error_results(str(exc), batch_size=len(batch_trajectories))
+
+
+def _score_batch_controls(
+    control_signals_batch: Sequence[Sequence[Sequence[float]]],
+    scene_token: str,
+    log_name: str,
+    metric_cache_dir: str,
+    scoring_version: str = "v1",
+    scorer_v1: PDMScorerV1 | None = None,
+) -> BatchScoreResponse:
+    """Score from direct control signals (bypass LQR controller)."""
+    import numpy as np
+    batch = list(control_signals_batch)
+    try:
+        scene = load_scene_context(
+            cache_dir=metric_cache_dir,
+            log_name=log_name,
+            token=scene_token,
+        )
+        scorer = scorer_v1 or PDMScorerV1()
+        controls = np.array(batch, dtype=np.float64)
+        results = scorer.score_batch_from_controls(control_signals=controls, scene=scene)
+        return BatchScoreResponse(results=[_result_to_response(r) for r in results])
+    except Exception as exc:
+        return _error_results(str(exc), batch_size=len(batch))
 
 
 def _score_batch_rl(
@@ -239,6 +266,33 @@ def create_app() -> FastAPI:
             include_ego=payload.include_ego,
             scorer_v1=request.app.state.scorer_v1,
             scorer_v2=request.app.state.scorer_v2,
+        )
+        return batch_response.results[0]
+
+    # ── Control Signal Scoring (bypass LQR) ────────────────────────────
+
+    @app.post("/v1/score/control/batch", response_model=BatchScoreResponse)
+    def score_control_batch(payload: BatchControlScoreRequest, request: Request) -> BatchScoreResponse:
+        cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
+        return _score_batch_controls(
+            control_signals_batch=payload.control_signals_batch,
+            scene_token=payload.scene_token,
+            log_name=payload.log_name,
+            metric_cache_dir=cache_dir,
+            scoring_version=payload.scoring_version,
+            scorer_v1=request.app.state.scorer_v1,
+        )
+
+    @app.post("/v1/score/control", response_model=ScoreResponse)
+    def score_control(payload: ControlScoreRequest, request: Request) -> ScoreResponse:
+        cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
+        batch_response = _score_batch_controls(
+            control_signals_batch=[payload.control_signals],
+            scene_token=payload.scene_token,
+            log_name=payload.log_name,
+            metric_cache_dir=cache_dir,
+            scoring_version=payload.scoring_version,
+            scorer_v1=request.app.state.scorer_v1,
         )
         return batch_response.results[0]
 

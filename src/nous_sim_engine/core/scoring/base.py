@@ -5,6 +5,7 @@ from typing import Iterable, List, Sequence
 
 import numpy as np
 import numpy.typing as npt
+import shapely
 import shapely.vectorized
 from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
@@ -95,6 +96,8 @@ class RLScorerConfig:
     collision_distance_scale: float = 2.0
     dac_margin: float = 2.0
     tlc_margin: float = 1.0
+    obstacle_clearance_margin: float = 5.0  # STRtree query buffer & distance cap (meters)
+    boundary_clearance_margin: float = 2.0  # distance cap for boundary clearance (meters)
 
     progress_distance_threshold: float = 5.0
     ttc_horizon: float = 4.0  # match 4s simulation horizon
@@ -181,22 +184,46 @@ class ScorerBase:
 
     @staticmethod
     def _derive_relative_headings(waypoints_xy: np.ndarray) -> np.ndarray:
-        dxy = np.diff(waypoints_xy, axis=1)
-        raw_fwd = np.arctan2(dxy[..., 1], dxy[..., 0])
-        headings = np.concatenate([raw_fwd, raw_fwd[:, -1:]], axis=1)
-        dist = np.linalg.norm(dxy, axis=-1)
-        dist_full = np.concatenate([dist, dist[:, -1:]], axis=1)
-        near_zero = dist_full < 1e-6
-        if np.any(near_zero):
-            for i in range(headings.shape[1]):
-                if i > 0:
-                    headings[:, i] = np.where(near_zero[:, i], headings[:, i - 1], headings[:, i])
-                else:
-                    headings[:, i] = np.where(near_zero[:, i], 0.0, headings[:, i])
+        """Derive headings from xy waypoints using cubic spline tangent direction.
+
+        Simple arctan2(dy, dx) on sparse 0.5s waypoints gives the chord direction
+        between consecutive points, not the tangent at each point.  On curves this
+        introduces significant heading error that propagates through LQR simulation
+        and causes false drivable-area violations.
+
+        Cubic spline fit + first derivative gives the tangent heading, which is
+        consistent with NavSim/RecogDrive where the agent directly outputs heading.
+        """
+        from scipy.interpolate import CubicSpline
+
+        batch_size, num_points, _ = waypoints_xy.shape
+        t = np.arange(num_points, dtype=np.float64)
+        headings = np.zeros((batch_size, num_points), dtype=np.float64)
+
+        for b in range(batch_size):
+            x, y = waypoints_xy[b, :, 0], waypoints_xy[b, :, 1]
+
+            # Degenerate case: all points nearly identical (stationary)
+            total_dist = np.sum(np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2))
+            if total_dist < 1e-6:
+                headings[b] = 0.0
+                continue
+
+            cs_x = CubicSpline(t, x)
+            cs_y = CubicSpline(t, y)
+            # heading = tangent direction = arctan2(dy/dt, dx/dt)
+            headings[b] = np.arctan2(cs_y(t, 1), cs_x(t, 1))
+
         return headings
 
     @staticmethod
     def _ego_to_global(waypoints_xy: np.ndarray, ego_state: np.ndarray) -> np.ndarray:
+        """Convert ego-relative waypoints to global SE2.
+
+        Expects ego-relative waypoints in NUPLAN frame:
+        - x: forward
+        - y: left
+        """
         batch_size, horizon, _ = waypoints_xy.shape
         ego_x = float(ego_state[StateIndex.X])
         ego_y = float(ego_state[StateIndex.Y])
@@ -276,27 +303,37 @@ class ScorerBase:
         num_extended = num_coarse + 1
         num_fine = (num_extended - 1) * ratio + 1
 
-        alphas = np.arange(ratio, dtype=np.float64) / ratio
-        start_xy = extended[:, :-1, :2]
-        end_xy = extended[:, 1:, :2]
-        start_h = extended_heading[:, :-1]
-        end_h = extended_heading[:, 1:]
+        # Cubic spline interpolation for xy and heading (consistent tangent)
+        from scipy.interpolate import CubicSpline
 
-        a = alphas[None, None, :, None]
-        interp_xy = start_xy[:, :, None, :] * (1 - a) + end_xy[:, :, None, :] * a
-        a_h = alphas[None, None, :]
-        interp_h = start_h[:, :, None] * (1 - a_h) + end_h[:, :, None] * a_h
-
-        fine_xy = np.concatenate(
-            [interp_xy.reshape(batch_size, -1, 2), extended[:, -1:, :2]], axis=1,
-        )
-        fine_heading = np.concatenate(
-            [interp_h.reshape(batch_size, -1), extended_heading[:, -1:]], axis=1,
-        )
+        t_coarse = np.arange(num_extended, dtype=np.float64)
+        t_fine = np.linspace(0, num_extended - 1, num_fine)
 
         proposals = np.zeros((batch_size, num_fine, 3), dtype=np.float64)
-        proposals[..., :2] = fine_xy
-        proposals[..., 2] = normalize_angle(fine_heading)
+        for b in range(batch_size):
+            total_dist = np.sum(np.linalg.norm(
+                np.diff(extended[b, :, :2], axis=0), axis=1,
+            ))
+            if total_dist < 0.1:
+                # Near-stationary: use ego heading, no spline
+                proposals[b, :, 0] = extended[b, 0, 0]
+                proposals[b, :, 1] = extended[b, 0, 1]
+                proposals[b, :, 2] = extended[b, 0, 2]
+                continue
+            cs_x = CubicSpline(t_coarse, extended[b, :, 0])
+            cs_y = CubicSpline(t_coarse, extended[b, :, 1])
+            proposals[b, :, 0] = cs_x(t_fine)
+            proposals[b, :, 1] = cs_y(t_fine)
+            # Heading from cubic spline tangent (consistent with xy curve)
+            dx = cs_x(t_fine, 1)
+            dy = cs_y(t_fine, 1)
+            speed = np.sqrt(dx ** 2 + dy ** 2)
+            heading = np.where(
+                speed > 1e-6,
+                np.arctan2(dy, dx),
+                extended_heading[b, 0],  # fallback to ego heading
+            )
+            proposals[b, :, 2] = normalize_angle(heading)
         return proposals  # (B, 41, 3) always includes ego at t=0
 
     def _waypoints_to_proposals(self, waypoints_xy: np.ndarray, ego_state: np.ndarray) -> np.ndarray:
@@ -763,14 +800,21 @@ class ScorerBase:
 
     # ── RL continuous: safety layer ───────────────────────────────────
 
-    def _nc_continuous(
+    def _collision_metrics(
         self,
         simulated_states: np.ndarray,
         ego_polygons: np.ndarray,
         ego_areas: np.ndarray,
         scene: SceneContext,
         rl_config: RLScorerConfig,
-    ) -> np.ndarray:
+    ) -> dict:
+        """NC continuous score + raw collision geometry.
+
+        Returns dict with:
+            "nc": np.ndarray (batch_size,) — existing NC continuous [0,1]
+            "max_collision_overlap": np.ndarray (batch_size,) — worst-frame overlap_area/ego_area [0,1]
+            "max_collision_penetration_distance": np.ndarray (batch_size,) — sqrt(overlap_area), linear-scale proxy (meters)
+        """
         del rl_config
 
         batch_size = len(ego_polygons)
@@ -778,6 +822,8 @@ class ScorerBase:
 
         collision_records: list[dict[str, tuple[float, float]]] = [{} for _ in range(batch_size)]
         forgiven: list[set[str]] = [set(scene.collided_track_ids) for _ in range(batch_size)]
+        max_overlaps = np.zeros(batch_size, dtype=np.float64)
+        max_penetration_dists = np.zeros(batch_size, dtype=np.float64)
 
         for time_idx in range(num_steps):
             occupancy_map = self._get_occupancy_map(scene, time_idx)
@@ -814,6 +860,8 @@ class ScorerBase:
 
                     overlap = ego_poly.intersection(track_polygon).area
                     severity = min(overlap / ego_area, 1.0)
+                    max_overlaps[pi] = max(max_overlaps[pi], severity)
+                    max_penetration_dists[pi] = max(max_penetration_dists[pi], float(np.sqrt(overlap)))
                     floor, cum_prod = collision_records[pi][token]
                     collision_records[pi][token] = (floor, cum_prod * (1.0 - severity))
 
@@ -822,7 +870,11 @@ class ScorerBase:
             for token, (at_fault_floor, cum_prod) in collision_records[pi].items():
                 penalty = at_fault_floor + (1.0 - at_fault_floor) * cum_prod
                 scores[pi] = min(scores[pi], penalty)
-        return scores
+        return {
+            "nc": scores,
+            "max_collision_overlap": max_overlaps,
+            "max_collision_penetration_distance": max_penetration_dists,
+        }
 
     _DAC_STRUCTURAL_LAYERS = frozenset({"roadblock", "intersection"})
 
@@ -860,11 +912,149 @@ class ScorerBase:
                 inside = float(ego_poly.intersection(local_union).area)
                 coverage = min(inside / ego_area, 1.0)
 
-                scores[proposal_idx] *= coverage
-                if scores[proposal_idx] < 1e-6:
-                    scores[proposal_idx] = 0.0
+                scores[proposal_idx] = min(scores[proposal_idx], coverage)
+                if scores[proposal_idx] == 0.0:
                     break
         return scores
+
+    def _min_obstacle_distance(
+        self, ego_polygons: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> np.ndarray:
+        """Min distance from ego to nearest obstacle across all frames. Returns meters.
+
+        Uses shapely 2.0 vectorized STRtree.nearest + shapely.distance for performance.
+        """
+        batch_size, num_steps = ego_polygons.shape[:2]
+        min_dists = np.full(batch_size, np.inf, dtype=np.float64)
+        margin = rl_config.obstacle_clearance_margin
+
+        for time_idx in range(num_steps):
+            occupancy_map = self._get_occupancy_map(scene, time_idx)
+            if occupancy_map is None or occupancy_map._tree is None or len(occupancy_map) == 0:
+                continue
+
+            ego_batch = ego_polygons[:, time_idx]  # (B,) shapely Polygon array
+            nearest_idx = occupancy_map._tree.nearest(ego_batch)
+            nearest_polys = occupancy_map._polygons[nearest_idx]
+            dists = shapely.distance(ego_batch, nearest_polys)
+            min_dists = np.minimum(min_dists, dists)
+
+        return np.clip(np.where(np.isinf(min_dists), margin, min_dists), 0.0, margin)
+
+    def _obstacle_distance_series(
+        self, ego_polygons: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> np.ndarray:
+        """Per-step nearest obstacle distance for each proposal. Shape: (B, T)."""
+        batch_size, num_steps = ego_polygons.shape[:2]
+        margin = rl_config.obstacle_clearance_margin
+        dist_series = np.full((batch_size, num_steps), margin, dtype=np.float64)
+
+        for time_idx in range(num_steps):
+            occupancy_map = self._get_occupancy_map(scene, time_idx)
+            if occupancy_map is None or occupancy_map._tree is None or len(occupancy_map) == 0:
+                continue
+            for pi in range(batch_size):
+                ego_poly = ego_polygons[pi, time_idx]
+                nearby_idx = occupancy_map._tree.query(ego_poly.buffer(margin), predicate="intersects")
+                if len(nearby_idx) == 0:
+                    continue
+                valid = np.array([
+                    RED_LIGHT_TOKEN_PREFIX not in occupancy_map._tokens[j] for j in nearby_idx
+                ])
+                if not valid.any():
+                    continue
+                nearby_polys = occupancy_map._polygons[nearby_idx[valid]]
+                dists = shapely.distance(
+                    np.full(len(nearby_polys), ego_poly, dtype=object), nearby_polys,
+                )
+                if len(dists) > 0:
+                    dist_series[pi, time_idx] = float(np.clip(np.min(dists), 0.0, margin))
+        return dist_series
+
+    def _min_obstacle_distance(
+        self, ego_polygons: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> np.ndarray:
+        """Min distance from ego to nearest obstacle across all frames. Returns meters."""
+        return self._obstacle_distance_series(ego_polygons, scene, rl_config).min(axis=1)
+
+    def _mean_obstacle_distance_within(
+        self, ego_polygons: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> np.ndarray:
+        """Mean distance to obstacles within margin, averaged across frames.
+
+        Per-scene normalization denominator for obstacle safety reward.
+        Fallback to margin if no obstacles within range.
+        """
+        batch_size, _ = ego_polygons.shape[:2]
+        margin = rl_config.obstacle_clearance_margin
+        dist_series = self._obstacle_distance_series(ego_polygons, scene, rl_config)
+        masked = np.where(dist_series <= margin, dist_series, np.nan)
+        means = np.nanmean(masked, axis=1)
+        means = np.where(np.isnan(means), margin, means)
+        return means.astype(np.float64)
+
+    def _half_lane_width(
+        self, scene: SceneContext,
+    ) -> float:
+        """Distance from centerline to ego's lane polygon boundary at ego position.
+
+        Uses the LANE/LANE_CONNECTOR polygon that contains ego for accurate single-lane
+        half-width. Falls back to drivable_union boundary if ego is not inside any lane.
+        Returns meters.
+        """
+        ego_x = scene.ego_state[StateIndex.X]
+        ego_y = scene.ego_state[StateIndex.Y]
+        ego_pt = Point(ego_x, ego_y)
+        proj_dist = scene.centerline.linestring.project(ego_pt)
+        cl_pt = scene.centerline.linestring.interpolate(proj_dist)
+
+        lane_layers = {SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR}
+        dm = scene.drivable_area_map
+        for token, layer_name in zip(dm.tokens, dm.types):
+            if _layer_name_to_enum(layer_name) not in lane_layers:
+                continue
+            poly = dm[token]
+            if poly.contains(ego_pt):
+                return max(cl_pt.distance(poly.boundary), 0.5)
+
+        # Fallback: centerline to full drivable boundary
+        drivable = dm.drivable_union
+        if drivable.is_empty:
+            return 2.0
+        return max(cl_pt.distance(drivable.boundary), 0.5)
+
+    def _boundary_distance_series_raw(
+        self, ego_coords: np.ndarray, scene: SceneContext,
+    ) -> np.ndarray:
+        """Per-step raw min distance from ego corners to drivable boundary. Shape: (B, T)."""
+        corners = ego_coords[:, :, :4, :]  # (B, T, 4, 2)
+        B, T = corners.shape[:2]
+
+        drivable = scene.drivable_area_map.drivable_union
+        if drivable.is_empty:
+            return np.zeros((B, T), dtype=np.float64)
+        boundary = drivable.boundary
+
+        flat_points = shapely.points(corners.reshape(-1, 2))
+        flat_inside = shapely.contains(drivable, flat_points)
+        flat_dists = shapely.distance(flat_points, boundary)
+        flat_dists[~flat_inside] = 0.0
+        dists = flat_dists.reshape(B, T, 4).min(axis=2)
+        return np.maximum(dists, 0.0)
+
+    def _boundary_distance_series(
+        self, ego_coords: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> np.ndarray:
+        """Per-step capped min distance from ego corners to drivable boundary. Shape: (B, T)."""
+        margin = rl_config.boundary_clearance_margin
+        dists = self._boundary_distance_series_raw(ego_coords, scene)
+        return np.clip(dists, 0.0, margin)
+
+    def _min_boundary_distance(
+        self, ego_coords: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> np.ndarray:
+        """Min distance from ego corner to drivable area boundary. Returns meters."""
+        return self._boundary_distance_series(ego_coords, scene, rl_config).min(axis=1)
 
     def _ddc_continuous(
         self, ego_coords: np.ndarray, ego_areas: np.ndarray,
@@ -1037,6 +1227,195 @@ class ScorerBase:
             else:
                 scores[proposal_idx] = 1.0 - (mean_dev - lo) / (hi - lo)
         return scores
+
+    def _signed_lateral_offset_at(self, center_xy, centerline_ls) -> float:
+        """Compute signed lateral offset. Positive = right of centerline."""
+        ego_pt = Point(*center_xy)
+        proj_dist = centerline_ls.project(ego_pt)
+        cl_pt = centerline_ls.interpolate(proj_dist)
+        dx = ego_pt.x - cl_pt.x
+        dy = ego_pt.y - cl_pt.y
+        # Tangent via finite difference
+        eps = 0.1
+        length = centerline_ls.length
+        p_before = centerline_ls.interpolate(max(proj_dist - eps, 0.0))
+        p_after = centerline_ls.interpolate(min(proj_dist + eps, length))
+        tangent_x = p_after.x - p_before.x
+        tangent_y = p_after.y - p_before.y
+        # Cross product: positive = left in x-forward/y-left frame
+        cross = tangent_x * dy - tangent_y * dx
+        norm = max(np.hypot(tangent_x, tangent_y), 1e-9)
+        return -cross / norm  # negate: positive = right
+
+    def _lateral_offset_signed(
+        self, ego_coords: np.ndarray, ego_areas: np.ndarray, scene: SceneContext,
+    ) -> np.ndarray:
+        """Mean signed lateral offset from centerline per proposal. Shape: (batch,)"""
+        centers = ego_coords[:, :, BBCoordsIndex.CENTER, :]
+        batch_size = len(ego_coords)
+        result = np.zeros(batch_size, dtype=np.float64)
+        cl_ls = scene.centerline.linestring
+
+        for proposal_idx in range(batch_size):
+            offsets = []
+            for time_idx in range(ego_coords.shape[1]):
+                if ego_areas[proposal_idx, time_idx, EgoAreaIndex.IN_INTERSECTION]:
+                    continue
+                offsets.append(
+                    self._signed_lateral_offset_at(centers[proposal_idx, time_idx], cl_ls)
+                )
+            if offsets:
+                result[proposal_idx] = float(np.mean(offsets))
+        return result
+
+    def _lateral_offset_change(
+        self, ego_coords: np.ndarray, ego_areas: np.ndarray, scene: SceneContext,
+    ) -> np.ndarray:
+        """Signed offset at last non-intersection timestep minus first. Shape: (batch,)"""
+        centers = ego_coords[:, :, BBCoordsIndex.CENTER, :]
+        batch_size = len(ego_coords)
+        result = np.zeros(batch_size, dtype=np.float64)
+        cl_ls = scene.centerline.linestring
+
+        for proposal_idx in range(batch_size):
+            first_offset = None
+            last_offset = None
+            for time_idx in range(ego_coords.shape[1]):
+                if ego_areas[proposal_idx, time_idx, EgoAreaIndex.IN_INTERSECTION]:
+                    continue
+                offset = self._signed_lateral_offset_at(centers[proposal_idx, time_idx], cl_ls)
+                if first_offset is None:
+                    first_offset = offset
+                last_offset = offset
+            if first_offset is not None and last_offset is not None:
+                result[proposal_idx] = last_offset - first_offset
+        return result
+
+    def _centerline_geometry(
+        self, ego_coords: np.ndarray, ego_areas: np.ndarray, scene: SceneContext,
+    ) -> dict:
+        centers = ego_coords[:, :, BBCoordsIndex.CENTER, :]
+        batch_size, num_steps = centers.shape[:2]
+        cl_ls = scene.centerline.linestring
+        start_signed = np.zeros(batch_size, dtype=np.float64)
+        end_signed = np.zeros(batch_size, dtype=np.float64)
+        mean_dist = np.zeros(batch_size, dtype=np.float64)
+        max_dist = np.zeros(batch_size, dtype=np.float64)
+        local_points = self._sample_local_centerline_points(scene)
+
+        for proposal_idx in range(batch_size):
+            signed_offsets = []
+            abs_dists = []
+            for time_idx in range(num_steps):
+                if ego_areas[proposal_idx, time_idx, EgoAreaIndex.IN_INTERSECTION]:
+                    continue
+                center_xy = centers[proposal_idx, time_idx]
+                signed = self._signed_lateral_offset_at(center_xy, cl_ls)
+                signed_offsets.append(signed)
+                abs_dists.append(Point(*center_xy).distance(cl_ls))
+            if signed_offsets:
+                start_signed[proposal_idx] = float(signed_offsets[0])
+                end_signed[proposal_idx] = float(signed_offsets[-1])
+                mean_dist[proposal_idx] = float(np.mean(abs_dists))
+                max_dist[proposal_idx] = float(np.max(abs_dists))
+
+        return {
+            "start_signed": start_signed,
+            "end_signed": end_signed,
+            "mean_distance": mean_dist,
+            "max_distance": max_dist,
+            "local_centerline_points": local_points,
+        }
+
+    def _sample_local_centerline_points(
+        self, scene: SceneContext, num_points: int = 6, horizon_m: float = 30.0,
+    ) -> list[list[float]]:
+        cl = scene.centerline
+        ego_x = float(scene.ego_state[StateIndex.X])
+        ego_y = float(scene.ego_state[StateIndex.Y])
+        ego_h = float(scene.ego_state[StateIndex.HEADING])
+        ego_pt = Point(ego_x, ego_y)
+        start_progress = cl.project(ego_pt)
+        sample_ds = np.linspace(start_progress, min(start_progress + horizon_m, cl.length), num_points)
+        cos_h = np.cos(-ego_h)
+        sin_h = np.sin(-ego_h)
+        points = []
+        for d in sample_ds:
+            p = cl.interpolate(float(d))
+            dx = float(p.x) - ego_x
+            dy = float(p.y) - ego_y
+            local_x = dx * cos_h - dy * sin_h
+            local_y = dx * sin_h + dy * cos_h
+            points.append([local_x, local_y])
+        return points
+
+    def _boundary_geometry(
+        self, ego_coords: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> dict:
+        dists = self._boundary_distance_series_raw(ego_coords, scene)
+        centers = ego_coords[:, :, BBCoordsIndex.CENTER, :]
+        sides: list[str | None] = []
+        cl_ls = scene.centerline.linestring
+        for proposal_idx in range(len(ego_coords)):
+            closest_idx = int(np.argmin(dists[proposal_idx]))
+            center_xy = centers[proposal_idx, closest_idx]
+            signed = self._signed_lateral_offset_at(center_xy, cl_ls)
+            if signed > 0:
+                sides.append("right")
+            elif signed < 0:
+                sides.append("left")
+            else:
+                sides.append(None)
+        return {
+            "distances": dists,
+            "start": dists[:, 0],
+            "end": dists[:, -1],
+            "min": dists.min(axis=1),
+            "mean": dists.mean(axis=1),
+            "side": sides,
+        }
+
+    def _obstacle_geometry(
+        self, ego_polygons: np.ndarray, ego_coords: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> dict:
+        dists = self._obstacle_distance_series(ego_polygons, scene, rl_config)
+        centers = ego_coords[:, :, BBCoordsIndex.CENTER, :]
+        sides: list[str | None] = []
+        closest_steps: list[int | None] = []
+        for proposal_idx in range(len(ego_polygons)):
+            closest_idx = int(np.argmin(dists[proposal_idx]))
+            closest_steps.append(closest_idx)
+            center_xy = centers[proposal_idx, closest_idx]
+            if center_xy[1] > 0:
+                sides.append("left")
+            elif center_xy[1] < 0:
+                sides.append("right")
+            else:
+                sides.append(None)
+        return {
+            "distances": dists,
+            "start": dists[:, 0],
+            "end": dists[:, -1],
+            "min": dists.min(axis=1),
+            "side": sides,
+            "closest_step": closest_steps,
+        }
+
+    def _topology_occupancy(self, ego_areas: np.ndarray) -> dict:
+        in_intersection = ego_areas[:, :, EgoAreaIndex.IN_INTERSECTION].astype(bool)
+        oncoming = ego_areas[:, :, EgoAreaIndex.ONCOMING_TRAFFIC].astype(bool)
+        non_drivable = ego_areas[:, :, EgoAreaIndex.NON_DRIVABLE_AREA].astype(bool)
+        multiple_lanes = ego_areas[:, :, EgoAreaIndex.MULTIPLE_LANES].astype(bool)
+        return {
+            "in_intersection_flags": in_intersection,
+            "oncoming_flags": oncoming,
+            "non_drivable_flags": non_drivable,
+            "multiple_lanes_flags": multiple_lanes,
+            "in_intersection_fraction": in_intersection.mean(axis=1),
+            "oncoming_fraction": oncoming.mean(axis=1),
+            "non_drivable_fraction": non_drivable.mean(axis=1),
+            "multiple_lanes_fraction": multiple_lanes.mean(axis=1),
+        }
 
     def _hc_continuous(
         self, simulated_states: np.ndarray, scene: SceneContext,

@@ -76,6 +76,38 @@ class RLScoringResult:
     time_to_collision: float = 1.0
     lane_keeping: float = 1.0
     history_comfort: float = 1.0
+    # Raw physics for decoupled reward construction
+    max_collision_overlap: float = 0.0   # worst-frame overlap_area/ego_area [0,1]
+    max_collision_penetration_distance: float = 0.0  # PDMS-aligned linear intrusion proxy (meters)
+    min_obstacle_distance: float = 0.0   # min distance to nearest obstacle (meters)
+    min_boundary_distance: float = 0.0   # min distance to drivable boundary (meters)
+    mean_obstacle_distance_5m: float = 5.0  # mean distance to obstacles within 5m (meters)
+    half_lane_width: float = 2.0         # centerline to drivable boundary distance (meters)
+    lateral_offset_signed: float = 0.0   # mean signed lateral offset (positive = right)
+    lateral_offset_change: float = 0.0   # signed offset end minus start (positive = drifted right)
+    centerline_lateral_offset_start_signed: float = 0.0
+    centerline_lateral_offset_end_signed: float = 0.0
+    centerline_distance_mean: float = 0.0
+    centerline_distance_max: float = 0.0
+    local_centerline_points: List[List[float]] = field(default_factory=list)
+    boundary_distance_start: float = 0.0
+    boundary_distance_end: float = 0.0
+    boundary_distance_min: float = 0.0
+    boundary_distance_mean: float = 0.0
+    boundary_distances: List[float] = field(default_factory=list)
+    boundary_side: Optional[str] = None
+    in_intersection_fraction: float = 0.0
+    oncoming_fraction: float = 0.0
+    non_drivable_fraction: float = 0.0
+    multiple_lanes_fraction: float = 0.0
+    in_intersection_flags: List[bool] = field(default_factory=list)
+    oncoming_flags: List[bool] = field(default_factory=list)
+    non_drivable_flags: List[bool] = field(default_factory=list)
+    multiple_lanes_flags: List[bool] = field(default_factory=list)
+    # Discrete mode: GRPO reward signals
+    safety_gate: float = 1.0       # NC × DAC × DDC × TLC binary product
+    raw_progress: float = 0.0      # centerline progress in meters, gated by safety
+    pdms_score: float = 0.0        # standard PDMS (GT-normalized), for monitoring only
     error: Optional[str] = None
 
     def to_dict(self) -> dict:

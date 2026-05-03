@@ -29,6 +29,13 @@ class PDMScorerV1(ScorerBase):
     def score(self, waypoints_xy: np.ndarray, scene: SceneContext) -> ScoringResult:
         return self.score_batch(waypoints_xy[None, ...], scene)[0]
 
+    def score_from_controls(
+        self,
+        control_signals: np.ndarray,
+        scene: SceneContext,
+    ) -> ScoringResult:
+        return self.score_batch_from_controls(control_signals[None, ...], scene)[0]
+
     def score_batch(
         self,
         trajectories_xy: np.ndarray,
@@ -41,13 +48,40 @@ class PDMScorerV1(ScorerBase):
         simulated_states = self._simulator.simulate_proposals(
             ego_state=scene.ego_state, proposals=proposals, observation=scene.observation,
         )
+        return self._score_from_simulated(simulated_states, scene, len(batch_waypoints))
+
+    def score_batch_from_controls(
+        self,
+        control_signals: np.ndarray,
+        scene: SceneContext,
+    ) -> List[ScoringResult]:
+        """Score from direct control signals, bypassing LQR controller."""
+        control_signals = np.asarray(control_signals, dtype=np.float64)
+        if control_signals.ndim == 2:
+            control_signals = control_signals[None, ...]
+        if control_signals.ndim != 3 or control_signals.shape[-1] != 2:
+            raise ValueError(f"control_signals must be (B, T, 2), got {control_signals.shape}")
+
+        simulated_states = self._simulator.simulate_from_controls(
+            ego_state=scene.ego_state,
+            control_signals=control_signals,
+            observation=scene.observation,
+        )
+        return self._score_from_simulated(simulated_states, scene, len(control_signals))
+
+    def _score_from_simulated(
+        self,
+        simulated_states: np.ndarray,
+        scene: SceneContext,
+        batch_size: int,
+    ) -> List[ScoringResult]:
         ego_coords = state_to_coords(simulated_states, self._vehicle)
         ego_polygons = coords_to_polygons(ego_coords)
         ego_areas = self._calculate_ego_areas(ego_coords, scene)
 
         # V1: only NC * DAC (2 multiplicative metrics)
-        multi_metrics = np.ones((len(batch_waypoints), len(MultiMetricIndex)), dtype=np.float64)
-        weighted_metrics = np.ones((len(batch_waypoints), len(WeightedMetricIndex)), dtype=np.float64)
+        multi_metrics = np.ones((batch_size, len(MultiMetricIndex)), dtype=np.float64)
+        weighted_metrics = np.ones((batch_size, len(WeightedMetricIndex)), dtype=np.float64)
 
         # NC: use observation-based collision types (recogride behavior)
         multi_metrics[:, MultiMetricIndex.NO_COLLISION] = self._no_at_fault_collision(

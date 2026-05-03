@@ -6,13 +6,21 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import numpy as np
+from nous_common.coordinates import CoordinateConverter
+
 
 class SimEngineClientError(RuntimeError):
     """Raised when the sim engine returns an invalid HTTP response."""
 
 
 class SimEngineClient:
-    """Lightweight urllib-based HTTP client for the nous-sim-engine service."""
+    """Lightweight urllib-based HTTP client for the nous-sim-engine service.
+
+    Public API defaults to NOUS ego frame for trajectory inputs. The client handles
+    NOUS -> NUPLAN conversion for requests, and converts selected geometry outputs
+    (e.g. local_centerline_points) back to NOUS-friendly semantics.
+    """
 
     def __init__(self, base_url: str = "http://localhost:8100", timeout: float = 30.0):
         self._base_url = base_url.rstrip("/")
@@ -26,6 +34,7 @@ class SimEngineClient:
         scene_token: str,
         log_name: str,
         dataset: str,
+        trajectory_frame: Literal["nous", "nuplan"] = "nous",
     ) -> Tuple[float, dict[str, Any]]:
         """Score a single trajectory and return ``(pdm_score, full_result_dict)``."""
         try:
@@ -33,7 +42,7 @@ class SimEngineClient:
                 method="POST",
                 path="/v1/score",
                 payload={
-                    "trajectory": trajectory,
+                    "trajectory": self._normalize_trajectory_input(trajectory, trajectory_frame),
                     "scene_token": scene_token,
                     "log_name": log_name,
                     "dataset": dataset,
@@ -44,6 +53,7 @@ class SimEngineClient:
             return 0.0, error_result
 
         result = self._normalize_result(response, endpoint="/v1/score")
+        result = self._normalize_output(result)
         pdm_score = self._result_score(result)
         if result.get("error"):
             return 0.0, result
@@ -55,6 +65,7 @@ class SimEngineClient:
         scene_token: str,
         log_name: str,
         dataset: str,
+        trajectory_frame: Literal["nous", "nuplan"] = "nous",
     ) -> List[dict[str, Any]]:
         """Score a batch of trajectories and return the raw result dicts."""
         try:
@@ -62,7 +73,7 @@ class SimEngineClient:
                 method="POST",
                 path="/v1/score/batch",
                 payload={
-                    "trajectories": trajectories,
+                    "trajectories": [self._normalize_trajectory_input(t, trajectory_frame) for t in trajectories],
                     "scene_token": scene_token,
                     "log_name": log_name,
                     "dataset": dataset,
@@ -84,7 +95,55 @@ class SimEngineClient:
                 for _ in trajectories
             ]
 
-        return [self._normalize_result(item, endpoint="/v1/score/batch") for item in results]
+        return [self._normalize_output(self._normalize_result(item, endpoint="/v1/score/batch")) for item in results]
+
+    # ── Control Signal Scoring (bypass LQR) ────────────────────────────
+
+    def score_control(
+        self,
+        control_signals: List[List[float]],
+        scene_token: str,
+        log_name: str,
+        dataset: str,
+    ) -> Tuple[float, dict[str, Any]]:
+        """Score control signals (accel, heading_rate) via direct kinematics."""
+        payload = {
+            "control_signals": control_signals,
+            "scene_token": scene_token,
+            "log_name": log_name,
+            "dataset": dataset,
+        }
+        try:
+            response = self._request_json(method="POST", path="/v1/score/control", payload=payload)
+        except SimEngineClientError as exc:
+            return 0.0, {"error": str(exc), "pdm_score": 0.0}
+        result = self._normalize_result(response, endpoint="/v1/score/control")
+        result = self._normalize_output(result)
+        score = result.get("pdm_score", 0.0)
+        if result.get("error"):
+            return 0.0, result
+        return score, result
+
+    def score_batch_control(
+        self,
+        control_signals_batch: List[List[List[float]]],
+        scene_token: str,
+        log_name: str,
+        dataset: str,
+    ) -> List[dict[str, Any]]:
+        """Score a batch of control signals."""
+        payload = {
+            "control_signals_batch": control_signals_batch,
+            "scene_token": scene_token,
+            "log_name": log_name,
+            "dataset": dataset,
+        }
+        try:
+            response = self._request_json(method="POST", path="/v1/score/control/batch", payload=payload)
+        except SimEngineClientError as exc:
+            return [{"error": str(exc), "pdm_score": 0.0} for _ in control_signals_batch]
+        results = response.get("results", [])
+        return [self._normalize_output(self._normalize_result(item, endpoint="/v1/score/control/batch")) for item in results]
 
     # ── RL Scoring (continuous / discrete) ──────────────────────────────
 
@@ -96,10 +155,11 @@ class SimEngineClient:
         dataset: str,
         scoring_mode: Literal["continuous", "discrete"] = "continuous",
         config_overrides: Optional[Dict[str, float]] = None,
+        trajectory_frame: Literal["nous", "nuplan"] = "nous",
     ) -> Tuple[float, dict[str, Any]]:
         """Score a single trajectory with RL reward and return ``(rl_score, full_result_dict)``."""
         payload: dict[str, Any] = {
-            "trajectory": trajectory,
+            "trajectory": self._normalize_trajectory_input(trajectory, trajectory_frame),
             "scene_token": scene_token,
             "log_name": log_name,
             "dataset": dataset,
@@ -115,6 +175,7 @@ class SimEngineClient:
             return 0.0, error_result
 
         result = self._normalize_rl_result(response, endpoint="/v1/score/rl")
+        result = self._normalize_output(result)
         rl_score = self._rl_result_score(result)
         if result.get("error"):
             return 0.0, result
@@ -128,10 +189,11 @@ class SimEngineClient:
         dataset: str,
         scoring_mode: Literal["continuous", "discrete"] = "continuous",
         config_overrides: Optional[Dict[str, float]] = None,
+        trajectory_frame: Literal["nous", "nuplan"] = "nous",
     ) -> List[dict[str, Any]]:
         """Score a batch of trajectories with RL reward."""
         payload: dict[str, Any] = {
-            "trajectories": trajectories,
+            "trajectories": [self._normalize_trajectory_input(t, trajectory_frame) for t in trajectories],
             "scene_token": scene_token,
             "log_name": log_name,
             "dataset": dataset,
@@ -158,7 +220,7 @@ class SimEngineClient:
                 for _ in trajectories
             ]
 
-        return [self._normalize_rl_result(item, endpoint="/v1/score/rl/batch") for item in results]
+        return [self._normalize_output(self._normalize_rl_result(item, endpoint="/v1/score/rl/batch")) for item in results]
 
     # ── Dataset Management ──────────────────────────────────────────────
 
@@ -241,6 +303,32 @@ class SimEngineClient:
             raise SimEngineClientError(f"Response from {path} is not valid UTF-8") from exc
         except json.JSONDecodeError as exc:
             raise SimEngineClientError(f"Response from {path} is not valid JSON: {exc.msg}") from exc
+
+    def _normalize_trajectory_input(
+        self, trajectory: List[List[float]], trajectory_frame: Literal["nous", "nuplan"]
+    ) -> List[List[float]]:
+        if trajectory_frame == "nuplan":
+            return trajectory
+        arr = np.asarray(trajectory, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            raise SimEngineClientError(f"Invalid trajectory shape for conversion: {arr.shape}")
+        xy = CoordinateConverter.nous_to_nuplan_batch(arr[:, :2])
+        if arr.shape[1] == 2:
+            return xy.tolist()
+        return np.column_stack([xy, arr[:, 2:]]).tolist()
+
+    def _normalize_output(self, result: dict[str, Any]) -> dict[str, Any]:
+        pts = result.get("local_centerline_points")
+        if isinstance(pts, list):
+            converted = []
+            for item in pts:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                x_nous, y_nous = CoordinateConverter.nuplan_to_nous(float(item[0]), float(item[1]))
+                converted.append([x_nous, y_nous])
+            result = dict(result)
+            result["local_centerline_points"] = converted
+        return result
 
     def _normalize_result(self, response: Any, endpoint: str) -> dict[str, Any]:
         if not isinstance(response, dict):

@@ -173,6 +173,31 @@ class TestRLScoring:
         # All sub_rewards in [0, 1]
         for key, val in data["sub_rewards"].items():
             assert 0.0 <= val <= 1.0, f"sub_reward {key}={val} out of [0,1]"
+        for key in [
+            "centerline_lateral_offset_start_signed",
+            "centerline_lateral_offset_end_signed",
+            "centerline_distance_mean",
+            "centerline_distance_max",
+            "boundary_distance_start",
+            "boundary_distance_end",
+            "boundary_distance_min",
+            "boundary_distance_mean",
+            "in_intersection_fraction",
+            "oncoming_fraction",
+            "non_drivable_fraction",
+            "multiple_lanes_fraction",
+        ]:
+            assert key in data
+        assert isinstance(data["local_centerline_points"], list)
+        assert isinstance(data["boundary_distances"], list)
+        assert isinstance(data["in_intersection_flags"], list)
+        assert isinstance(data["oncoming_flags"], list)
+        assert isinstance(data["non_drivable_flags"], list)
+        assert isinstance(data["multiple_lanes_flags"], list)
+        assert 0.0 <= data["in_intersection_fraction"] <= 1.0
+        assert 0.0 <= data["oncoming_fraction"] <= 1.0
+        assert 0.0 <= data["non_drivable_fraction"] <= 1.0
+        assert 0.0 <= data["multiple_lanes_fraction"] <= 1.0
 
     # ── 3.2 Basic discrete mode ──────────────────────────────────────
 
@@ -232,6 +257,10 @@ class TestRLScoring:
         assert len(data["results"]) == 2
         safe_result = data["results"][0]
         offroad_result = data["results"][1]
+        for result in data["results"]:
+            assert "centerline_distance_mean" in result
+            assert "boundary_distances" in result
+            assert "in_intersection_flags" in result
         # Safe should score higher than offroad
         assert safe_result["rl_score"] >= offroad_result["rl_score"]
         # Offroad should have lower DAC
@@ -313,6 +342,8 @@ class TestClientRL:
         assert result["error"] is None
         assert "sub_rewards" in result
         assert set(result["sub_rewards"].keys()) == {"nc", "dac", "ddc", "tlc", "ep", "ttc", "lk", "hc"}
+        assert "centerline_distance_mean" in result
+        assert "boundary_distances" in result
 
     def test_client_score_rl_discrete(self, sim_client, safe_trajectory):
         rl_score, result = sim_client.score_rl(
