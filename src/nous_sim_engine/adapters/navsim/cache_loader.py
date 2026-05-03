@@ -224,15 +224,14 @@ def _extract_log_name_from_path(file_path: str | Path) -> str | None:
     return None
 
 
-def _extract_gt_trajectory_xy(
+def _extract_pdm_trajectory_xy(
     metric_cache: Any, ego_state_array: np.ndarray,
     num_future_steps: int = 40,
 ) -> np.ndarray | None:
-    """Extract GT trajectory as ego-relative (x, y) waypoints at 0.1s resolution.
+    """Extract MetricCache.trajectory as ego-relative PDM reference waypoints.
 
-    MetricCache.trajectory is an InterpolatedTrajectory sampled at 0.1s.
-    We take sampled[0:num_future_steps+1] (include t=0, keep 41 pts = ego + 4s @ 0.1s).
-    The t=0 point becomes [0, 0] in ego-relative coordinates.
+    MetricCache.trajectory is the explicit PDM closed-loop reference used by V1 scoring.
+    We keep sampled[0:num_future_steps+1] so t=0 remains the ego anchor.
     """
     trajectory = getattr(metric_cache, "trajectory", None)
     if trajectory is None:
@@ -244,27 +243,42 @@ def _extract_gt_trajectory_xy(
     if len(sampled) < 2:
         return None
 
-    # Take sampled[0:41] — include t=0 (ego pose), keep up to 41 steps @ 0.1s
     end_idx = min(num_future_steps + 1, len(sampled))
     global_xy = np.array(
         [[s.rear_axle.x, s.rear_axle.y] for s in sampled[0:end_idx]],
         dtype=np.float64,
     )
 
-    # Ego pose
     ego_x = ego_state_array[0]
     ego_y = ego_state_array[1]
     ego_h = ego_state_array[2]
     cos_h = np.cos(-ego_h)
     sin_h = np.sin(-ego_h)
 
-    # Global → ego-relative
     dx = global_xy[:, 0] - ego_x
     dy = global_xy[:, 1] - ego_y
     local_x = dx * cos_h - dy * sin_h
     local_y = dx * sin_h + dy * cos_h
 
-    return np.stack([local_x, local_y], axis=1)  # (<=41, 2) with t=0 ≈ [0, 0]
+    return np.stack([local_x, local_y], axis=1)
+
+
+def _extract_gt_trajectory_xy(metric_cache: Any) -> np.ndarray | None:
+    """Extract human/open-loop GT trajectory as ego-relative (x, y) waypoints.
+
+    NavSim MetricCache.human_trajectory stores local poses at 0.5s spacing.
+    Prefer this human/open-loop source for analysis/debug GT context.
+    """
+    human_trajectory = getattr(metric_cache, "human_trajectory", None)
+    poses = getattr(human_trajectory, "poses", None)
+    if poses is None:
+        return None
+
+    poses = np.asarray(poses, dtype=np.float64)
+    if poses.ndim != 2 or poses.shape[0] == 0 or poses.shape[1] < 2:
+        return None
+
+    return poses[:, :2].copy()
 
 
 _AGENT_TYPE_NAMES = {"VEHICLE", "PEDESTRIAN", "BICYCLE", "EGO"}
@@ -330,7 +344,8 @@ def metric_cache_to_scene_context(metric_cache: MetricCache, scene_token: str) -
         route_lane_ids={str(lane_id) for lane_id in metric_cache.route_lane_ids},
         centerline=_convert_centerline(metric_cache.centerline),
         collided_track_ids=_extract_collided_track_ids(metric_cache),
-        gt_trajectory=_extract_gt_trajectory_xy(metric_cache, ego_state_array),
+        gt_trajectory=_extract_gt_trajectory_xy(metric_cache),
+        pdm_trajectory=_extract_pdm_trajectory_xy(metric_cache, ego_state_array),
         track_object_types=_extract_track_object_types(metric_cache),
     )
 
@@ -339,10 +354,15 @@ def metric_cache_to_scene_context(metric_cache: MetricCache, scene_token: str) -
 
 
 @lru_cache(maxsize=256)
-def load_scene_context(cache_dir: str | Path, log_name: str, token: str) -> SceneContext:
+def _load_scene_context_cached(
+    cache_dir: str | Path,
+    log_name: str,
+    token: str,
+    boost_cache_dir: str | None,
+) -> SceneContext:
     # L2: boost cache (fast pickle, ~24ms)
-    if _boost_cache_dir is not None:
-        boost_path = _boost_cache_path(_boost_cache_dir, log_name, token)
+    if boost_cache_dir is not None:
+        boost_path = _boost_cache_path(boost_cache_dir, log_name, token)
         if boost_path.exists():
             ctx = _load_from_boost(boost_path)
             _attach_rl_precompute(ctx)
@@ -353,13 +373,22 @@ def load_scene_context(cache_dir: str | Path, log_name: str, token: str) -> Scen
     ctx = metric_cache_to_scene_context(metric_cache=metric_cache, scene_token=token)
 
     # Lazy write-back to boost cache
-    if _boost_cache_dir is not None:
+    if boost_cache_dir is not None:
         try:
-            _save_to_boost(ctx, _boost_cache_path(_boost_cache_dir, log_name, token))
+            _save_to_boost(ctx, _boost_cache_path(boost_cache_dir, log_name, token))
         except Exception:
             pass  # best-effort
 
     return ctx
+
+
+def load_scene_context(cache_dir: str | Path, log_name: str, token: str) -> SceneContext:
+    return _load_scene_context_cached(cache_dir, log_name, token, _boost_cache_dir)
+
+
+load_scene_context.cache_clear = _load_scene_context_cached.cache_clear
+load_scene_context.cache_info = _load_scene_context_cached.cache_info
+load_scene_context.cache_parameters = _load_scene_context_cached.cache_parameters
 
 
 # ── Boost cache layer ──────────────────────────────────────────────────

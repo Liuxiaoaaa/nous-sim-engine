@@ -704,7 +704,69 @@ class ScorerBase:
             scores[proposal_idx] = 1.0 if ego_is_comfortable(padded, time_points_s) else 0.0
         return scores
 
-    # ── GT simulation ─────────────────────────────────────────────────
+    # ── Reference simulation ──────────────────────────────────────────
+
+    def _simulate_and_score_reference(
+        self,
+        reference_trajectory: np.ndarray | None,
+        scene: SceneContext,
+    ) -> _GTSimResult | None:
+        """Simulate one reference trajectory and compute shared metrics.
+
+        This helper is intentionally reference-agnostic: callers decide whether the
+        trajectory is GT (analysis/debug side channel) or PDM (official v1 reference
+        context). The simulation logic is shared, but the semantics are owned by the
+        caller-specific wrapper.
+        """
+        if reference_trajectory is None:
+            return None
+
+        trajectory = np.asarray(reference_trajectory, dtype=np.float64)
+        if trajectory.ndim != 2 or trajectory.shape[-1] not in (2, 3) or trajectory.shape[0] == 0:
+            return None
+
+        try:
+            reference_waypoints = trajectory[None, ...]
+            if reference_waypoints.shape[1] == self.REQUIRED_NUM_WAYPOINTS:
+                proposals = self._build_proposals(reference_waypoints, scene)
+            else:
+                proposals = self._waypoints_to_proposals(reference_waypoints, scene.ego_state)
+
+            simulated = self._simulator.simulate_proposals(
+                ego_state=scene.ego_state, proposals=proposals, observation=scene.observation,
+            )
+            coords = state_to_coords(simulated, self._vehicle)
+            polygons = coords_to_polygons(coords)
+            areas = self._calculate_ego_areas(coords, scene)
+
+            progress = float(self._progress(coords, scene)[0])
+
+            multi = np.ones(len(MultiMetricIndex), dtype=np.float64)
+            multi[MultiMetricIndex.NO_COLLISION] = self._no_at_fault_collision(
+                simulated, polygons, areas, scene,
+            )[0]
+            multi[MultiMetricIndex.DRIVABLE_AREA] = self._drivable_area_compliance(areas)[0]
+            multi[MultiMetricIndex.DRIVING_DIRECTION] = self._driving_direction_compliance(
+                coords, areas, scene,
+            )[0]
+            multi[MultiMetricIndex.TRAFFIC_LIGHT] = self._traffic_light_compliance(
+                polygons, scene,
+            )[0]
+
+            weighted = np.ones(len(WeightedMetricIndex), dtype=np.float64)
+            weighted[WeightedMetricIndex.TTC] = self._time_to_collision(
+                simulated, coords, areas, scene,
+            )[0]
+            weighted[WeightedMetricIndex.LANE_KEEPING] = self._lane_keeping(
+                coords, areas, scene,
+            )[0]
+            weighted[WeightedMetricIndex.COMFORT] = self._history_comfort(
+                simulated, scene,
+            )[0]
+
+            return _GTSimResult(progress=progress, multi_metrics=multi, weighted_metrics=weighted)
+        except Exception:
+            return None
 
     def _simulate_and_score_gt(
         self,
@@ -713,56 +775,20 @@ class ScorerBase:
         multi_indices: list[int] | None = None,
         weighted_indices: list[int] | None = None,
     ) -> _GTSimResult | None:
-        """Simulate GT trajectory once, compute all metrics."""
-        if scene.gt_trajectory is None:
-            return None
+        """Simulate GT once for analysis-only side-channel metrics.
 
-        gt_trajectory = np.asarray(scene.gt_trajectory, dtype=np.float64)
-        if gt_trajectory.ndim != 2 or gt_trajectory.shape[-1] not in (2, 3) or gt_trajectory.shape[0] == 0:
-            return None
+        This must not be read as the official v1 scoring reference path. GT remains
+        available so diagnostics, open-loop comparisons, and optional debug tooling
+        can coexist with the explicit PDM reference context.
+        """
+        return self._simulate_and_score_reference(scene.gt_trajectory, scene)
 
-        try:
-            gt_waypoints = gt_trajectory[None, ...]
-            if gt_waypoints.shape[1] == self.REQUIRED_NUM_WAYPOINTS:
-                gt_proposals = self._build_proposals(gt_waypoints, scene)
-            else:
-                gt_proposals = self._waypoints_to_proposals(gt_waypoints, scene.ego_state)
-
-            gt_simulated = self._simulator.simulate_proposals(
-                ego_state=scene.ego_state, proposals=gt_proposals, observation=scene.observation,
-            )
-            gt_coords = state_to_coords(gt_simulated, self._vehicle)
-            gt_polygons = coords_to_polygons(gt_coords)
-            gt_areas = self._calculate_ego_areas(gt_coords, scene)
-
-            progress = float(self._progress(gt_coords, scene)[0])
-
-            multi = np.ones(len(MultiMetricIndex), dtype=np.float64)
-            multi[MultiMetricIndex.NO_COLLISION] = self._no_at_fault_collision(
-                gt_simulated, gt_polygons, gt_areas, scene,
-            )[0]
-            multi[MultiMetricIndex.DRIVABLE_AREA] = self._drivable_area_compliance(gt_areas)[0]
-            multi[MultiMetricIndex.DRIVING_DIRECTION] = self._driving_direction_compliance(
-                gt_coords, gt_areas, scene,
-            )[0]
-            multi[MultiMetricIndex.TRAFFIC_LIGHT] = self._traffic_light_compliance(
-                gt_polygons, scene,
-            )[0]
-
-            weighted = np.ones(len(WeightedMetricIndex), dtype=np.float64)
-            weighted[WeightedMetricIndex.TTC] = self._time_to_collision(
-                gt_simulated, gt_coords, gt_areas, scene,
-            )[0]
-            weighted[WeightedMetricIndex.LANE_KEEPING] = self._lane_keeping(
-                gt_coords, gt_areas, scene,
-            )[0]
-            weighted[WeightedMetricIndex.COMFORT] = self._history_comfort(
-                gt_simulated, scene,
-            )[0]
-
-            return _GTSimResult(progress=progress, multi_metrics=multi, weighted_metrics=weighted)
-        except Exception:
-            return None
+    def _simulate_and_score_pdm(
+        self,
+        scene: SceneContext,
+    ) -> _GTSimResult | None:
+        """Simulate the explicit PDM trajectory used as official v1 reference context."""
+        return self._simulate_and_score_reference(scene.pdm_trajectory, scene)
 
     # ── Human penalty filter ──────────────────────────────────────────
 
@@ -1116,17 +1142,20 @@ class ScorerBase:
     def _ep_continuous(
         self, ego_coords: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
         *,
-        gt_masked_progress: float | None = None,
+        reference_masked_progress: float | None = None,
     ) -> np.ndarray:
-        """Continuous ego progress, normalized by GT masked progress.
+        """Continuous ego progress normalized by a caller-provided denominator.
 
         Fallback chain:
-            1. gt_masked_progress param (from caller / online computation)
-            2. scene.gt_masked_progress (precomputed in warmup)
-            3. progress_distance_threshold (5m, no GT available)
+            1. reference_masked_progress param (typically official PDM masked progress)
+            2. progress_distance_threshold (5m, no reference available)
+
+        This helper no longer assigns any implicit official-reference meaning to GT.
+        If a caller wants to analyze GT-normalized progress for diagnostics, it must
+        resolve and pass that denominator explicitly as an analysis choice.
         """
         raw_progress = self._progress(ego_coords, scene)
-        denominator = gt_masked_progress or scene.gt_masked_progress
+        denominator = reference_masked_progress
         if denominator is not None and denominator > rl_config.progress_distance_threshold:
             return np.clip(raw_progress / denominator, 0.0, 1.0)
         return np.clip(raw_progress / rl_config.progress_distance_threshold, 0.0, 1.0)

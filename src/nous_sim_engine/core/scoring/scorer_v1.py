@@ -98,20 +98,10 @@ class PDMScorerV1(ScorerBase):
         )
 
         progress_raw = self._progress(ego_coords, scene)
-
-        # GT masked progress for normalization
-        # recogdrive puts GT in batch; max(masked) = gt_raw * gt_NC * gt_DAC
-        gt_result = self._simulate_and_score_gt(scene)
-        gt_masked_progress: float | None = None
-        if gt_result is not None:
-            gt_multi = float(
-                gt_result.multi_metrics[MultiMetricIndex.NO_COLLISION]
-                * gt_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA]
-            )
-            gt_masked_progress = gt_result.progress * gt_multi
+        pdm_masked_progress = self._resolve_pdm_masked_progress(scene)
 
         weighted_metrics[:, WeightedMetricIndex.PROGRESS] = self._normalize_progress_v1(
-            progress_raw, multi_metrics, gt_masked_progress=gt_masked_progress,
+            progress_raw, multi_metrics, pdm_masked_progress=pdm_masked_progress,
         )
         weighted_metrics[:, WeightedMetricIndex.TTC] = self._time_to_collision(
             simulated_states, ego_coords, ego_areas, scene,
@@ -142,35 +132,60 @@ class PDMScorerV1(ScorerBase):
             ))
         return results
 
+    def _resolve_pdm_masked_progress(self, scene: SceneContext) -> float | None:
+        """Resolve the official v1 reference denominator from explicit PDM context.
+
+        Preference order:
+            1. scene.pdm_masked_progress (precomputed official reference)
+            2. Online PDM simulation from scene.pdm_trajectory
+            3. None (caller falls back to batch max)
+
+        GT fields may coexist on the scene for analysis/debug purposes, but they do
+        not define official v1 reference semantics here.
+        """
+        if scene.pdm_masked_progress is not None:
+            return scene.pdm_masked_progress
+
+        pdm_result = self._simulate_and_score_pdm(scene)
+        if pdm_result is None:
+            return None
+
+        pdm_multi = float(
+            pdm_result.multi_metrics[MultiMetricIndex.NO_COLLISION]
+            * pdm_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA]
+        )
+        return float(pdm_result.progress * pdm_multi)
+
     def _normalize_progress_v1(
         self,
         progress_raw: np.ndarray,
         multi_metrics: np.ndarray,
         *,
-        gt_masked_progress: float | None = None,
+        pdm_masked_progress: float | None = None,
     ) -> np.ndarray:
-        """V1 progress normalization aligned with recogdrive.
+        """V1 progress normalization aligned with official PDM reference context.
 
-        recogdrive logic (GT is in batch at pred_idx=0):
-            masked = raw * multi           (multi = NC * DAC for v1)
-            max_masked = max(masked)        (= gt_raw * gt_NC * gt_DAC)
-            if max_masked > 5m:
-                norm = masked / max_masked
-            else:
-                norm = 1.0 where multi > 0, else 0.0
+        Keep raw progress centerline-based, preserve v1 multiplicative metrics, and
+        normalize with masked_pred / max(masked_pred, masked_pdm) when a valid PDM
+        denominator exists. Only fall back to batch max when PDM reference is unavailable.
 
-        gt_masked_progress = gt_raw * gt_NC * gt_DAC, computed from GT simulation.
+        Any GT-derived progress that remains on SceneContext is analysis-only side
+        data and must not be interpreted as the official v1 denominator here.
         """
         multi_prod = multi_metrics[
             :, [MultiMetricIndex.NO_COLLISION, MultiMetricIndex.DRIVABLE_AREA]
         ].prod(axis=1)
         masked_progress = progress_raw * multi_prod
 
-        # Prefer GT masked progress (matches recogdrive: max(batch_masked) ≈ gt_masked)
-        if gt_masked_progress is not None and gt_masked_progress > self._progress_distance_threshold:
-            normalized = np.clip(masked_progress / gt_masked_progress, 0.0, 1.0)
+        if pdm_masked_progress is not None and pdm_masked_progress > self._progress_distance_threshold:
+            denominator = np.maximum(masked_progress, pdm_masked_progress)
+            normalized = np.divide(
+                masked_progress,
+                denominator,
+                out=np.zeros_like(masked_progress, dtype=np.float64),
+                where=denominator > 0.0,
+            )
         else:
-            # Fallback: batch max
             max_masked = float(masked_progress.max()) if len(masked_progress) > 0 else 0.0
             if max_masked > self._progress_distance_threshold:
                 normalized = np.clip(masked_progress / max_masked, 0.0, 1.0)

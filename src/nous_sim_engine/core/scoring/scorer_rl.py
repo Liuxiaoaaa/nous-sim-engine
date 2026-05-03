@@ -25,32 +25,27 @@ class RLScorer(ScorerBase):
     ) -> RLScoringResult:
         return self.score_batch(waypoints_xy[None, ...], scene, rl_config)[0]
 
-    def _resolve_gt_masked_progress(self, scene: SceneContext) -> float | None:
-        """Get gt_masked_progress: precomputed (warmup) or online fallback.
+    def _resolve_pdm_masked_progress(self, scene: SceneContext) -> float | None:
+        """Resolve RL EP denominator from official PDM reference context.
 
-        Fallback chain:
-            1. scene.gt_masked_progress (precomputed in warmup)
-            2. Online GT simulation → gt_progress × gt_NC × gt_DAC
-            3. None (no GT trajectory available)
+        Preference order:
+            1. scene.pdm_masked_progress (precomputed official reference)
+            2. Online PDM simulation from scene.pdm_trajectory
+            3. None (caller falls back to threshold)
+
+        GT fields may still be attached for open-loop analysis, diagnostics, or
+        optional debug, but they no longer define RL's main reference semantics.
         """
-        if scene.gt_masked_progress is not None:
-            return scene.gt_masked_progress
+        if scene.pdm_masked_progress is not None:
+            return scene.pdm_masked_progress
 
-        # Online fallback: simulate GT and compute masked progress
-        gt_result = self._simulate_and_score_gt(scene)
-        if gt_result is None:
+        pdm_result = self._simulate_and_score_pdm(scene)
+        if pdm_result is None:
             return None
 
-        gt_nc = float(gt_result.multi_metrics[MultiMetricIndex.NO_COLLISION])
-        gt_dac = float(gt_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA])
-        gt_masked = gt_result.progress * gt_nc * gt_dac
-
-        # Cache back to scene for subsequent calls in same request
-        scene.gt_masked_progress = gt_masked
-        if scene.gt_progress is None:
-            scene.gt_progress = gt_result.progress
-
-        return gt_masked
+        pdm_nc = float(pdm_result.multi_metrics[MultiMetricIndex.NO_COLLISION])
+        pdm_dac = float(pdm_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA])
+        return float(pdm_result.progress * pdm_nc * pdm_dac)
 
     def score_batch(
         self,
@@ -114,8 +109,13 @@ class RLScorer(ScorerBase):
             half_lane_w = 2.0
 
         # Performance layer: always continuous
-        gt_masked = self._resolve_gt_masked_progress(scene)
-        ep = self._ep_continuous(ego_coords, scene, rl_config, gt_masked_progress=gt_masked)
+        pdm_masked = self._resolve_pdm_masked_progress(scene)
+        ep = self._ep_continuous(
+            ego_coords,
+            scene,
+            rl_config,
+            reference_masked_progress=pdm_masked,
+        )
         ttc = self._ttc_continuous(simulated_states, ego_coords, ego_areas, scene, rl_config)
         lk = (
             self._lk_continuous(ego_coords, ego_areas, scene, rl_config)

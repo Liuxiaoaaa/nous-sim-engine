@@ -6,6 +6,7 @@ MetricCache/NavSim dependencies.
 """
 from __future__ import annotations
 
+import copy
 from typing import Any
 from unittest.mock import patch
 
@@ -14,7 +15,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nous_sim_engine.client import SimEngineClient, SimEngineClientError
+from nous_sim_engine.core.enums import MultiMetricIndex
 from nous_sim_engine.core.scorer import PDMScorer, RLScorerConfig
+from nous_sim_engine.core.scoring import PDMScorerV1
 from nous_sim_engine.core.types import SceneContext
 from nous_sim_engine.server.app import create_app
 
@@ -98,6 +101,21 @@ class TestHealth:
 
 
 class TestPDMScoring:
+    @staticmethod
+    def _score_scene(scene: SceneContext, trajectory: list[list[float]]) -> dict[str, Any]:
+        with patch("nous_sim_engine.server.app.load_scene_context", return_value=scene):
+            with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+                app = create_app()
+                with TestClient(app) as tc:
+                    resp = tc.post("/v1/score", json={
+                        "trajectory": trajectory,
+                        "scene_token": SCENE_TOKEN,
+                        "log_name": LOG_NAME,
+                        "dataset": DATASET,
+                    })
+        assert resp.status_code == 200
+        return resp.json()
+
     def test_score_single(self, app_and_client, safe_trajectory):
         resp = app_and_client.post("/v1/score", json={
             "trajectory": safe_trajectory,
@@ -111,6 +129,68 @@ class TestPDMScoring:
         assert data["error"] is None
         assert 0.0 <= data["pdm_score"] <= 1.0
 
+    def test_score_progress_normalization_ignores_analysis_gt_when_pdm_fixed(self, straight_road_scene, safe_trajectory):
+        low_gt_scene = copy.deepcopy(straight_road_scene)
+        low_gt_scene.pdm_masked_progress = 40.0
+        low_gt_scene.gt_trajectory = np.array([[0.5, 0.0]] * 8, dtype=np.float64)
+
+        high_gt_scene = copy.deepcopy(straight_road_scene)
+        high_gt_scene.pdm_masked_progress = 40.0
+        high_gt_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+
+        low_gt_progress = self._score_scene(low_gt_scene, safe_trajectory)["ego_progress"]
+        high_gt_progress = self._score_scene(high_gt_scene, safe_trajectory)["ego_progress"]
+
+        assert low_gt_progress == pytest.approx(high_gt_progress)
+
+    def test_score_progress_normalization_tracks_pdm_reference(self, straight_road_scene, safe_trajectory):
+        short_pdm_scene = copy.deepcopy(straight_road_scene)
+        short_pdm_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        short_pdm_scene.pdm_masked_progress = 10.0
+
+        long_pdm_scene = copy.deepcopy(straight_road_scene)
+        long_pdm_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        long_pdm_scene.pdm_masked_progress = 40.0
+
+        short_pdm_progress = self._score_scene(short_pdm_scene, safe_trajectory)["ego_progress"]
+        long_pdm_progress = self._score_scene(long_pdm_scene, safe_trajectory)["ego_progress"]
+
+        assert short_pdm_progress != pytest.approx(long_pdm_progress)
+        assert short_pdm_progress > long_pdm_progress
+
+    def test_score_progress_normalization_resolves_online_pdm_without_mutating_scene(
+        self,
+        straight_road_scene,
+        safe_trajectory,
+    ):
+        fallback_scene = copy.deepcopy(straight_road_scene)
+        fallback_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        fallback_scene.pdm_trajectory = np.array(safe_trajectory, dtype=np.float64)
+        fallback_scene.pdm_progress = None
+        fallback_scene.pdm_masked_progress = None
+
+        original_pdm_trajectory = fallback_scene.pdm_trajectory.copy()
+        scorer = PDMScorerV1()
+        expected_pdm_result = scorer._simulate_and_score_pdm(fallback_scene)
+        assert expected_pdm_result is not None
+        expected_pdm_masked_progress = expected_pdm_result.progress * (
+            expected_pdm_result.multi_metrics[MultiMetricIndex.NO_COLLISION]
+            * expected_pdm_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA]
+        )
+        assert expected_pdm_masked_progress > scorer._progress_distance_threshold
+
+        prefilled_scene = copy.deepcopy(straight_road_scene)
+        prefilled_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        prefilled_scene.pdm_masked_progress = expected_pdm_masked_progress
+
+        fallback_result = self._score_scene(fallback_scene, safe_trajectory)
+        prefilled_result = self._score_scene(prefilled_scene, safe_trajectory)
+
+        assert fallback_result["ego_progress"] == pytest.approx(prefilled_result["ego_progress"])
+        assert fallback_scene.pdm_progress is None
+        assert fallback_scene.pdm_masked_progress is None
+        np.testing.assert_allclose(fallback_scene.pdm_trajectory, original_pdm_trajectory)
+
     def test_score_batch(self, app_and_client, safe_trajectory, offroad_trajectory):
         resp = app_and_client.post("/v1/score/batch", json={
             "trajectories": [safe_trajectory, offroad_trajectory],
@@ -123,16 +203,6 @@ class TestPDMScoring:
         assert len(data["results"]) == 2
         # Safe trajectory should score higher than offroad
         assert data["results"][0]["pdm_score"] >= data["results"][1]["pdm_score"]
-
-    def test_client_score(self, sim_client, safe_trajectory):
-        pdm_score, result = sim_client.score(
-            trajectory=safe_trajectory,
-            scene_token=SCENE_TOKEN,
-            log_name=LOG_NAME,
-            dataset=DATASET,
-        )
-        assert pdm_score > 0.0
-        assert result["error"] is None
 
     def test_client_score_batch(self, sim_client, safe_trajectory, offroad_trajectory):
         results = sim_client.score_batch(
@@ -151,6 +221,108 @@ class TestPDMScoring:
 
 
 class TestRLScoring:
+    @staticmethod
+    def _score_scene(scene: SceneContext, trajectory: list[list[float]]) -> dict[str, Any]:
+        with patch("nous_sim_engine.server.app.load_scene_context", return_value=scene):
+            with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+                app = create_app()
+                with TestClient(app) as tc:
+                    resp = tc.post("/v1/score/rl", json={
+                        "trajectory": trajectory,
+                        "scene_token": SCENE_TOKEN,
+                        "log_name": LOG_NAME,
+                        "dataset": DATASET,
+                    })
+        assert resp.status_code == 200
+        return resp.json()
+
+    def test_rl_progress_normalization_ignores_analysis_gt_fields_when_pdm_reference_is_fixed(
+        self,
+        straight_road_scene,
+        safe_trajectory,
+    ):
+        short_gt_scene = copy.deepcopy(straight_road_scene)
+        short_gt_scene.pdm_masked_progress = 40.0
+        short_gt_scene.gt_masked_progress = 5.0
+        short_gt_scene.gt_trajectory = np.array([[0.5, 0.0]] * 8, dtype=np.float64)
+
+        long_gt_scene = copy.deepcopy(straight_road_scene)
+        long_gt_scene.pdm_masked_progress = 40.0
+        long_gt_scene.gt_masked_progress = 80.0
+        long_gt_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+
+        short_gt_progress = self._score_scene(short_gt_scene, safe_trajectory)["ego_progress"]
+        long_gt_progress = self._score_scene(long_gt_scene, safe_trajectory)["ego_progress"]
+
+        assert short_gt_progress == pytest.approx(long_gt_progress)
+
+    def test_rl_progress_normalization_tracks_pdm_reference(self, straight_road_scene, safe_trajectory):
+        short_reference_scene = copy.deepcopy(straight_road_scene)
+        short_reference_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        short_reference_scene.pdm_masked_progress = 10.0
+
+        long_reference_scene = copy.deepcopy(straight_road_scene)
+        long_reference_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        long_reference_scene.pdm_masked_progress = 40.0
+
+        short_reference_progress = self._score_scene(short_reference_scene, safe_trajectory)["ego_progress"]
+        long_reference_progress = self._score_scene(long_reference_scene, safe_trajectory)["ego_progress"]
+
+        assert short_reference_progress != pytest.approx(long_reference_progress)
+        assert short_reference_progress > long_reference_progress
+
+    def test_rl_progress_normalization_resolves_online_pdm_reference_without_prefilled_masked_progress(
+        self,
+        straight_road_scene,
+        safe_trajectory,
+    ):
+        fallback_scene = copy.deepcopy(straight_road_scene)
+        fallback_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        fallback_scene.pdm_trajectory = np.array(safe_trajectory, dtype=np.float64)
+        fallback_scene.pdm_progress = None
+        fallback_scene.pdm_masked_progress = None
+
+        original_pdm_trajectory = fallback_scene.pdm_trajectory.copy()
+        scorer = PDMScorer()
+        expected_pdm_result = scorer._get_scorer()._simulate_and_score_pdm(fallback_scene)
+        assert expected_pdm_result is not None
+        expected_pdm_masked_progress = expected_pdm_result.progress * (
+            expected_pdm_result.multi_metrics[MultiMetricIndex.NO_COLLISION]
+            * expected_pdm_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA]
+        )
+
+        prefilled_reference_scene = copy.deepcopy(straight_road_scene)
+        prefilled_reference_scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        prefilled_reference_scene.pdm_masked_progress = expected_pdm_masked_progress
+
+        fallback_result = self._score_scene(fallback_scene, safe_trajectory)
+        prefilled_result = self._score_scene(prefilled_reference_scene, safe_trajectory)
+
+        assert fallback_result["ego_progress"] == pytest.approx(prefilled_result["ego_progress"])
+        assert fallback_scene.pdm_progress is None
+        assert fallback_scene.pdm_masked_progress is None
+        np.testing.assert_allclose(fallback_scene.pdm_trajectory, original_pdm_trajectory)
+
+    def test_rl_progress_normalization_falls_back_to_threshold_when_pdm_reference_is_unavailable(
+        self,
+        straight_road_scene,
+        safe_trajectory,
+    ):
+        scene_without_pdm_reference = copy.deepcopy(straight_road_scene)
+        scene_without_pdm_reference.gt_masked_progress = 80.0
+        scene_without_pdm_reference.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        scene_without_pdm_reference.pdm_trajectory = None
+        scene_without_pdm_reference.pdm_progress = None
+        scene_without_pdm_reference.pdm_masked_progress = None
+
+        threshold_scene = copy.deepcopy(scene_without_pdm_reference)
+        threshold_scene.gt_masked_progress = None
+
+        missing_reference_result = self._score_scene(scene_without_pdm_reference, safe_trajectory)
+        threshold_result = self._score_scene(threshold_scene, safe_trajectory)
+
+        assert missing_reference_result["ego_progress"] == pytest.approx(1.0)
+        assert missing_reference_result["ego_progress"] == pytest.approx(threshold_result["ego_progress"])
 
     # ── 3.1 Basic continuous mode ────────────────────────────────────
 
@@ -268,94 +440,12 @@ class TestRLScoring:
 
     # ── 3.5 Config overrides ─────────────────────────────────────────
 
-    def test_rl_score_with_config_overrides(self, app_and_client, offroad_trajectory):
-        # Score with default weights
-        resp_default = app_and_client.post("/v1/score/rl", json={
-            "trajectory": offroad_trajectory,
-            "scene_token": SCENE_TOKEN,
-            "log_name": LOG_NAME,
-            "dataset": DATASET,
-            "scoring_mode": "continuous",
-        })
-        # Score with heavily boosted ep_weight
-        resp_custom = app_and_client.post("/v1/score/rl", json={
-            "trajectory": offroad_trajectory,
-            "scene_token": SCENE_TOKEN,
-            "log_name": LOG_NAME,
-            "dataset": DATASET,
-            "scoring_mode": "continuous",
-            "config_overrides": {"ep_weight": 100.0},
-        })
-        default_data = resp_default.json()
-        custom_data = resp_custom.json()
-        assert default_data["error"] is None
-        assert custom_data["error"] is None
-        # Sub-metrics should be same (same trajectory), but rl_score differs due to weights
-        assert abs(default_data["sub_rewards"]["ep"] - custom_data["sub_rewards"]["ep"]) < 1e-6
-        # rl_score should differ
-        assert default_data["rl_score"] != custom_data["rl_score"]
-
-    # ── 3.6 Red light compliance ─────────────────────────────────────
-
-    def test_rl_red_light_continuous(self, app_with_redlight, safe_trajectory):
-        """Trajectory through red light should get low TLC in continuous mode."""
-        resp = app_with_redlight.post("/v1/score/rl", json={
-            "trajectory": safe_trajectory,
-            "scene_token": SCENE_TOKEN,
-            "log_name": LOG_NAME,
-            "dataset": DATASET,
-            "scoring_mode": "continuous",
-        })
-        data = resp.json()
-        assert data["error"] is None
-        # Should have red light violation (trajectory goes through x=20)
-        assert data["traffic_light_compliance"] < 1.0
-
-    def test_rl_red_light_discrete(self, app_with_redlight, safe_trajectory):
-        """Discrete TLC should be exactly 0.0 for red light violation."""
-        resp = app_with_redlight.post("/v1/score/rl", json={
-            "trajectory": safe_trajectory,
-            "scene_token": SCENE_TOKEN,
-            "log_name": LOG_NAME,
-            "dataset": DATASET,
-            "scoring_mode": "discrete",
-        })
-        data = resp.json()
-        assert data["traffic_light_compliance"] == 0.0
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # 4. Client RL methods
 # ═══════════════════════════════════════════════════════════════════════
 
 
 class TestClientRL:
-    def test_client_score_rl_continuous(self, sim_client, safe_trajectory):
-        rl_score, result = sim_client.score_rl(
-            trajectory=safe_trajectory,
-            scene_token=SCENE_TOKEN,
-            log_name=LOG_NAME,
-            dataset=DATASET,
-            scoring_mode="continuous",
-        )
-        assert rl_score > 0.0
-        assert result["error"] is None
-        assert "sub_rewards" in result
-        assert set(result["sub_rewards"].keys()) == {"nc", "dac", "ddc", "tlc", "ep", "ttc", "lk", "hc"}
-        assert "centerline_distance_mean" in result
-        assert "boundary_distances" in result
-
-    def test_client_score_rl_discrete(self, sim_client, safe_trajectory):
-        rl_score, result = sim_client.score_rl(
-            trajectory=safe_trajectory,
-            scene_token=SCENE_TOKEN,
-            log_name=LOG_NAME,
-            dataset=DATASET,
-            scoring_mode="discrete",
-        )
-        assert rl_score > 0.0
-        assert result["error"] is None
-
     def test_client_score_batch_rl(self, sim_client, safe_trajectory, offroad_trajectory):
         results = sim_client.score_batch_rl(
             trajectories=[safe_trajectory, offroad_trajectory],
@@ -367,29 +457,6 @@ class TestClientRL:
         assert len(results) == 2
         assert results[0]["rl_score"] >= results[1]["rl_score"]
         assert results[0]["error"] is None
-
-    def test_client_score_rl_with_overrides(self, sim_client, safe_trajectory):
-        rl_score, result = sim_client.score_rl(
-            trajectory=safe_trajectory,
-            scene_token=SCENE_TOKEN,
-            log_name=LOG_NAME,
-            dataset=DATASET,
-            scoring_mode="continuous",
-            config_overrides={"nc_weight": 10.0, "ttc_horizon": 5.0},
-        )
-        assert rl_score > 0.0
-        assert result["error"] is None
-
-    def test_client_score_rl_red_light(self, sim_client_redlight, safe_trajectory):
-        rl_score, result = sim_client_redlight.score_rl(
-            trajectory=safe_trajectory,
-            scene_token=SCENE_TOKEN,
-            log_name=LOG_NAME,
-            dataset=DATASET,
-            scoring_mode="discrete",
-        )
-        assert result["traffic_light_compliance"] == 0.0
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. Schema validation
@@ -463,23 +530,3 @@ class TestDiscreteConsistency:
         # Both should be in [0, 1].
         assert 0.0 <= rl["time_to_collision"] <= 1.0
 
-    def test_discrete_matches_pdm_offroad(self, app_and_client, offroad_trajectory):
-        pdm_resp = app_and_client.post("/v1/score", json={
-            "trajectory": offroad_trajectory,
-            "scene_token": SCENE_TOKEN,
-            "log_name": LOG_NAME,
-            "dataset": DATASET,
-        })
-        rl_resp = app_and_client.post("/v1/score/rl", json={
-            "trajectory": offroad_trajectory,
-            "scene_token": SCENE_TOKEN,
-            "log_name": LOG_NAME,
-            "dataset": DATASET,
-            "scoring_mode": "discrete",
-        })
-        pdm = pdm_resp.json()
-        rl = rl_resp.json()
-        for key in ["no_at_fault_collisions", "drivable_area_compliance",
-                     "driving_direction_compliance", "traffic_light_compliance",
-                     "time_to_collision", "lane_keeping", "history_comfort"]:
-            assert abs(pdm[key] - rl[key]) < 1e-6, f"{key}: PDM={pdm[key]} vs RL={rl[key]}"

@@ -23,6 +23,17 @@ class VehicleParams:
 
 @dataclass
 class SceneContext:
+    """Scene data for scoring.
+
+    `gt_*` fields are analysis-side-channel inputs only: open-loop inspection,
+    diagnostics, and optional debug workflows. They are intentionally preserved so
+    downstream analysis can compare predictions against human GT, but they are not
+    the official v1 scoring reference.
+
+    `pdm_*` fields carry the explicit official v1 reference context used by main
+    v1 scoring and RL EP normalization when such a reference is available.
+    """
+
     scene_token: str
     log_name: str
     ego_state: np.ndarray
@@ -32,9 +43,12 @@ class SceneContext:
     route_lane_ids: Set[str]
     centerline: "PDMPath"
     collided_track_ids: Set[str] = field(default_factory=set)
-    gt_trajectory: Optional[np.ndarray] = None  # (T, 2) ego-relative GT xy waypoints
-    gt_progress: Optional[float] = None  # precomputed GT centerline progress (raw)
-    gt_masked_progress: Optional[float] = None  # gt_progress × gt_NC × gt_DAC (for EP normalization)
+    gt_trajectory: Optional[np.ndarray] = None  # (T, 2) ego-relative GT xy waypoints for open-loop analysis / diagnostics / optional debug
+    gt_progress: Optional[float] = None  # precomputed GT centerline progress (raw analysis-side-channel only)
+    gt_masked_progress: Optional[float] = None  # gt_progress × gt_NC × gt_DAC (analysis-side-channel only)
+    pdm_trajectory: Optional[np.ndarray] = None  # (T, 2) ego-relative PDM reference waypoints for official v1 scoring/reference semantics
+    pdm_progress: Optional[float] = None  # precomputed PDM centerline progress (raw official v1 reference)
+    pdm_masked_progress: Optional[float] = None  # pdm_progress × pdm_NC × pdm_DAC (official v1 reference)
     track_object_types: Dict[str, str] = field(default_factory=dict)  # token → "agent" | "static"
 
 

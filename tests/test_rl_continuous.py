@@ -1,19 +1,183 @@
-"""Tests for continuous RL scoring: NC (collision), DAC (sweep area), EP (GT progress).
+"""Tests for continuous RL scoring: NC (collision), DAC (sweep area), EP normalization.
 
 Uses synthetic scenes from conftest — no MetricCache dependency.
 All trajectories are 8 waypoints at 0.5s spacing (ego-relative xy).
 """
 from __future__ import annotations
 
+import lzma
+import pickle
+from pathlib import Path
+
 import numpy as np
 import pytest
 
+from nous_sim_engine.adapters.navsim.cache_loader import (
+    _load_pickle,
+    get_boost_cache_dir,
+    load_scene_context,
+    set_boost_cache_dir,
+)
 from nous_sim_engine.core.enums import SemanticMapLayer, StateIndex
 from nous_sim_engine.core.geometry import PDMPath
 from nous_sim_engine.core.observation import PDMObservation
 from nous_sim_engine.core.occupancy import DrivableMap
 from nous_sim_engine.core.scorer import PDMScorer, RLScorerConfig
+from nous_sim_engine.core.scoring.base import ScorerBase
 from nous_sim_engine.core.types import SceneContext
+
+
+METRIC_CACHE_SAMPLE_PATH = Path(
+    "/home/liuxiao34/data_augmentation_agents/mini_set_closed_loop/metric_cache/"
+    "2021.06.14.14.25.15_veh-26_04936_05073/unknown/815100c986ce5069/metric_cache.pkl"
+)
+
+
+class TestSceneContextReferenceSemantics:
+    def test_simulate_and_score_pdm_returns_none_without_pdm_reference(self):
+        scene = _build_scene(no_obstacle=True)
+
+        assert ScorerBase()._simulate_and_score_pdm(scene) is None
+
+    def test_simulate_and_score_pdm_uses_pdm_reference_not_analysis_gt(self):
+        scene = _build_scene(no_obstacle=True)
+        scene.gt_trajectory = np.array([[20.0, 0.0]] * 8, dtype=np.float64)
+        scene.pdm_trajectory = np.array([[0.5, 0.0]] * 8, dtype=np.float64)
+
+        scorer = ScorerBase()
+        pdm_result_a = scorer._simulate_and_score_pdm(scene)
+        gt_result_a = scorer._simulate_and_score_gt(scene)
+
+        scene.pdm_trajectory = np.array([[4.0, 0.0]] * 8, dtype=np.float64)
+        pdm_result_b = scorer._simulate_and_score_pdm(scene)
+        gt_result_b = scorer._simulate_and_score_gt(scene)
+
+        assert pdm_result_a is not None
+        assert pdm_result_b is not None
+        assert gt_result_a is not None
+        assert gt_result_b is not None
+        assert pdm_result_a.progress != pdm_result_b.progress
+        assert gt_result_a.progress == gt_result_b.progress
+
+    def test_scene_context_keeps_gt_and_pdm_reference_fields_separate(self):
+        ego_state = np.zeros(StateIndex.size(), dtype=np.float64)
+        ego_past_states = np.zeros((1, StateIndex.size()), dtype=np.float64)
+        observation = PDMObservation(num_steps=1, interval_time=0.1)
+        drivable_map = DrivableMap(tokens=[], types=[], polygons=np.array([], dtype=object))
+        centerline = PDMPath(np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64))
+
+        gt_trajectory = np.array([[1.0, 0.0], [2.0, 0.0]], dtype=np.float64)
+        pdm_trajectory = np.array([[0.5, 0.0], [1.5, 0.0]], dtype=np.float64)
+
+        scene = SceneContext(
+            scene_token="test",
+            log_name="test",
+            ego_state=ego_state,
+            ego_past_states=ego_past_states,
+            observation=observation,
+            drivable_area_map=drivable_map,
+            route_lane_ids=set(),
+            centerline=centerline,
+            gt_trajectory=gt_trajectory,
+            gt_progress=12.0,
+            gt_masked_progress=10.0,
+            pdm_trajectory=pdm_trajectory,
+            pdm_progress=11.0,
+            pdm_masked_progress=9.0,
+        )
+
+        assert np.array_equal(scene.gt_trajectory, gt_trajectory)
+        assert np.array_equal(scene.pdm_trajectory, pdm_trajectory)
+        assert scene.gt_trajectory is not scene.pdm_trajectory
+        assert scene.gt_progress == 12.0
+        assert scene.pdm_progress == 11.0
+        assert scene.gt_masked_progress == 10.0
+        assert scene.pdm_masked_progress == 9.0
+
+    def test_load_scene_context_uses_metric_cache_trajectory_as_pdm_reference(self, tmp_path: Path):
+        if not METRIC_CACHE_SAMPLE_PATH.is_file():
+            pytest.skip(
+                f"integration sample missing: {METRIC_CACHE_SAMPLE_PATH}"
+            )
+
+        with lzma.open(METRIC_CACHE_SAMPLE_PATH, "rb") as file_obj:
+            metric_cache = _load_pickle(file_obj)
+
+        log_name = "2021.06.14.14.25.15_veh-26_04936_05073"
+        scene_token = "815100c986ce5069"
+        cache_dir = METRIC_CACHE_SAMPLE_PATH.parents[3]
+        boost_cache_dir = tmp_path / "boost_cache"
+        previous_boost_cache_dir = get_boost_cache_dir()
+        load_scene_context.cache_clear()
+        try:
+            set_boost_cache_dir(str(boost_cache_dir))
+            scene = load_scene_context(cache_dir, log_name, scene_token)
+        finally:
+            load_scene_context.cache_clear()
+            set_boost_cache_dir(previous_boost_cache_dir)
+
+        sampled = list(metric_cache.trajectory.get_sampled_trajectory())
+        ego_x = float(metric_cache.ego_state.rear_axle.x)
+        ego_y = float(metric_cache.ego_state.rear_axle.y)
+        ego_heading = float(metric_cache.ego_state.rear_axle.heading)
+        cos_h = np.cos(-ego_heading)
+        sin_h = np.sin(-ego_heading)
+        expected_pdm = []
+        for state in sampled[: scene.pdm_trajectory.shape[0]]:
+            dx = float(state.rear_axle.x) - ego_x
+            dy = float(state.rear_axle.y) - ego_y
+            expected_pdm.append([dx * cos_h - dy * sin_h, dx * sin_h + dy * cos_h])
+        expected_pdm = np.asarray(expected_pdm, dtype=np.float64)
+
+        assert scene.pdm_trajectory is not None
+        assert scene.gt_trajectory is not None
+        assert scene.pdm_trajectory.shape[0] > scene.gt_trajectory.shape[0]
+        assert scene.pdm_trajectory.shape[1] == 2
+        assert scene.gt_trajectory.shape[1] == 2
+        assert not np.shares_memory(scene.pdm_trajectory, scene.gt_trajectory)
+        np.testing.assert_allclose(scene.pdm_trajectory, expected_pdm, atol=1e-6)
+        assert not np.allclose(
+            scene.pdm_trajectory[: scene.gt_trajectory.shape[0]],
+            scene.gt_trajectory,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            scene.gt_trajectory[:2],
+            np.asarray(metric_cache.human_trajectory.poses[:2, :2], dtype=np.float64),
+            atol=1e-6,
+        )
+
+    def test_load_scene_context_isolated_by_boost_cache_dir(self, tmp_path: Path):
+        cache_dir = tmp_path / "metric_cache"
+        log_name = "log_a"
+        token = "scene_a"
+        boost_dir_a = tmp_path / "boost_a"
+        boost_dir_b = tmp_path / "boost_b"
+        boost_dir_a_scene = boost_dir_a / log_name / f"{token}.pkl"
+        boost_dir_b_scene = boost_dir_b / log_name / f"{token}.pkl"
+        previous_boost_cache_dir = get_boost_cache_dir()
+        load_scene_context.cache_clear()
+        try:
+            boost_dir_a_scene.parent.mkdir(parents=True, exist_ok=True)
+            boost_dir_b_scene.parent.mkdir(parents=True, exist_ok=True)
+            with boost_dir_a_scene.open("wb") as file_obj:
+                pickle.dump(_build_scene(gt_progress=11.0), file_obj, protocol=pickle.HIGHEST_PROTOCOL)
+            with boost_dir_b_scene.open("wb") as file_obj:
+                pickle.dump(_build_scene(gt_progress=22.0), file_obj, protocol=pickle.HIGHEST_PROTOCOL)
+
+            set_boost_cache_dir(str(boost_dir_a))
+            scene_a = load_scene_context(cache_dir, log_name, token)
+
+            set_boost_cache_dir(str(boost_dir_b))
+            scene_b = load_scene_context(cache_dir, log_name, token)
+        finally:
+            load_scene_context.cache_clear()
+            set_boost_cache_dir(previous_boost_cache_dir)
+
+        assert scene_a.gt_progress == 11.0
+        assert scene_b.gt_progress == 22.0
+        assert scene_a.gt_progress != scene_b.gt_progress
+
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -115,7 +279,7 @@ def _build_scene(
     )
     if gt_progress is not None:
         ctx.gt_progress = gt_progress
-        ctx.gt_masked_progress = gt_progress  # assume GT has no collision/offroad
+        ctx.gt_masked_progress = gt_progress  # populate legacy analysis fields for normalization tests
     return ctx
 
 
@@ -254,45 +418,7 @@ class TestDACContinuous:
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 3. EP Continuous — GT-progress normalization
-# ═════════════════════════════════════════════════════════════════════════
-
-
-class TestEPContinuous:
-    """Test continuous ego progress with GT normalization."""
-
-    def test_gt_normalized_progress(self):
-        """When gt_progress is set, EP = raw_progress / gt_progress."""
-        scene = _build_scene(no_obstacle=True, gt_progress=20.0)
-        result = _score_rl(scene, _straight(2.0))
-        # Trajectory advances ~16m in 4s → EP ≈ 16/20 = 0.8
-        assert 0.5 < result.ego_progress <= 1.0, (
-            f"Expected EP ~0.8 with GT norm, got {result.ego_progress}"
-        )
-
-    def test_fallback_to_threshold_when_no_gt(self):
-        """Without gt_progress, EP = raw_progress / threshold (5.0)."""
-        scene = _build_scene(no_obstacle=True, gt_progress=None)
-        result = _score_rl(scene, _straight(2.0))
-        # Trajectory advances >>5m, so EP clipped to 1.0
-        assert result.ego_progress == 1.0
-
-    def test_ep_clipped_to_01(self):
-        """EP must be in [0, 1] even with gt_progress < raw progress."""
-        scene = _build_scene(no_obstacle=True, gt_progress=1.0)
-        result = _score_rl(scene, _straight(2.0))
-        assert 0.0 <= result.ego_progress <= 1.0
-
-    def test_slow_progress_is_lower(self):
-        """Slower trajectory → lower EP."""
-        scene = _build_scene(no_obstacle=True, gt_progress=20.0)
-        fast = _score_rl(scene, _straight(3.0)).ego_progress
-        slow = _score_rl(scene, _straight(1.0)).ego_progress
-        assert fast > slow, f"Fast EP ({fast}) should be > slow EP ({slow})"
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# 4. Config alignment: v1 defaults
+# 3. Config alignment: v1 defaults
 # ═════════════════════════════════════════════════════════════════════════
 
 
