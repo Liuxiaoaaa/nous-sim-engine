@@ -17,7 +17,7 @@ from nous_sim_engine.adapters.navsim.cache_loader import (
     warmup_boost_cache,
 )
 from nous_sim_engine.core.scoring import PDMScorerV1, PDMScorerV2, RLScorer
-from nous_sim_engine.core.scoring.base import PDMScorerConfig, RLScorerConfig
+from nous_sim_engine.core.scoring.base import RLScorerConfig
 from nous_sim_engine.core.types import RLScoringResult, ScoringResult
 
 from .registry import DatasetRegistry
@@ -204,7 +204,7 @@ def _init_registry() -> DatasetRegistry:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Pre-create scorer instances (shared across requests)
+    # Pre-create scorer instances (shared across requests).
     app.state.scorer_v1 = PDMScorerV1()
     app.state.scorer_v2 = PDMScorerV2()
     app.state.scorer_rl = RLScorer()

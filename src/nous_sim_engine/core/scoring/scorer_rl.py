@@ -4,18 +4,58 @@ from typing import List
 
 import numpy as np
 
-from ..enums import MultiMetricIndex
-from ..geometry import state_to_coords, coords_to_polygons
+from ..enums import MultiMetricIndex, SemanticMapLayer
+from ..geometry import state_to_coords, coords_to_polygons, calculate_progress
 from ..types import SceneContext, RLScoringResult
 from .base import ScorerBase, RLScorerConfig
 
 
 class RLScorer(ScorerBase):
-    """RL continuous reward scorer with 8 independent sub-rewards.
+    """RL reward scorer with continuous and discrete modes.
+
+    Continuous mode: independent continuous sub-rewards with soft safety gating.
+    Discrete mode: all sub-metrics aligned with PDMScorerV1 (binary NC/TTC/HC,
+    v1 progress normalization) for exact PDMS compatibility.
 
     Aggregation: safety_gate ^ alpha × weighted_avg(EP, TTC, LK, HC)
     where safety_gate = NC × DAC × DDC × TLC
     """
+
+    # V1 progress distance threshold (must match PDMScorerV1)
+    _PROGRESS_DISTANCE_THRESHOLD = 5.0
+
+    def _normalize_progress_v1_inline(
+        self,
+        progress_raw: np.ndarray,
+        nc: np.ndarray,
+        dac: np.ndarray,
+        pdm_masked_progress: float | None,
+    ) -> np.ndarray:
+        """V1-aligned progress normalization for discrete RL mode.
+
+        Replicates PDMScorerV1._normalize_progress_v1 exactly:
+        masked_progress = raw * NC * DAC, then normalize by
+        max(masked_pred, masked_pdm) when PDM reference exists.
+        """
+        multi_prod = nc * dac
+        masked_progress = progress_raw * multi_prod
+
+        if pdm_masked_progress is not None and pdm_masked_progress > self._PROGRESS_DISTANCE_THRESHOLD:
+            denominator = np.maximum(masked_progress, pdm_masked_progress)
+            return np.divide(
+                masked_progress,
+                denominator,
+                out=np.zeros_like(masked_progress, dtype=np.float64),
+                where=denominator > 0.0,
+            )
+
+        max_masked = float(masked_progress.max()) if len(masked_progress) > 0 else 0.0
+        if max_masked > self._PROGRESS_DISTANCE_THRESHOLD:
+            return np.clip(masked_progress / max_masked, 0.0, 1.0)
+
+        normalized = np.ones_like(progress_raw, dtype=np.float64)
+        normalized[multi_prod == 0.0] = 0.0
+        return normalized
 
     def score(
         self,
@@ -24,6 +64,58 @@ class RLScorer(ScorerBase):
         rl_config: RLScorerConfig | None = None,
     ) -> RLScoringResult:
         return self.score_batch(waypoints_xy[None, ...], scene, rl_config)[0]
+
+    def _pdm_per_step_progress(self, scene: SceneContext) -> np.ndarray | None:
+        """PDM per-step centerline arc-lengths, shape (1, T)."""
+        if scene.pdm_trajectory is None:
+            return None
+        try:
+            reference_waypoints = scene.pdm_trajectory[None, ...]
+            proposals = self._build_proposals(reference_waypoints, scene)
+            simulated = self._simulator.simulate_proposals(
+                ego_state=scene.ego_state, proposals=proposals, observation=scene.observation,
+            )
+            coords = state_to_coords(simulated, self._vehicle)
+            return calculate_progress(coords, scene.centerline)  # (1, T)
+        except Exception:
+            return None
+
+    def _progress_per_waypoint(
+        self, ego_coords: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,
+    ) -> List[List[float]]:
+        """8 values per proposal: pred_cumulative[i] / pdm_cumulative[i] at each waypoint."""
+        pred_projected = calculate_progress(ego_coords, scene.centerline)  # (B, T)
+        pdm_projected = self._pdm_per_step_progress(scene)  # (1, T) or None
+
+        # Waypoint sample indices: step 5,10,...,40 (clamped to available timesteps)
+        num_steps = pred_projected.shape[1]
+        all_wp = [5, 10, 15, 20, 25, 30, 35, 40]
+        wp_indices = [i for i in all_wp if i < num_steps]
+
+        results = []
+        for b in range(len(ego_coords)):
+            start = float(pred_projected[b, 0])
+            pred_cum = [max(0.0, float(pred_projected[b, idx]) - start) for idx in wp_indices]
+
+            if pdm_projected is not None:
+                pdm_start = float(pdm_projected[0, 0])
+                pdm_cum = [max(0.0, float(pdm_projected[0, min(idx, pdm_projected.shape[1] - 1)]) - pdm_start) for idx in wp_indices]
+                normalized = []
+                for i in range(len(wp_indices)):
+                    denom = pdm_cum[i]
+                    if denom < 0.1:  # PDM cumulative < 10cm = truly stopped
+                        normalized.append(1.0 if abs(pred_cum[i]) < 0.1 else 0.0)
+                    else:
+                        normalized.append(float(np.clip(pred_cum[i] / denom, 0.0, 1.0)))
+            else:
+                threshold = rl_config.progress_distance_threshold
+                normalized = [float(np.clip(p / threshold, 0.0, 1.0)) for p in pred_cum]
+
+            # Pad to 8 values if trajectory is shorter than expected
+            while len(normalized) < 8:
+                normalized.append(normalized[-1] if normalized else 0.0)
+            results.append(normalized)
+        return results
 
     def _resolve_pdm_masked_progress(self, scene: SceneContext) -> float | None:
         """Resolve RL EP denominator from official PDM reference context.
@@ -39,7 +131,11 @@ class RLScorer(ScorerBase):
         if scene.pdm_masked_progress is not None:
             return scene.pdm_masked_progress
 
-        pdm_result = self._simulate_and_score_pdm(scene)
+        pdm_result = self._simulate_and_score_pdm(
+            scene,
+            multi_indices=[MultiMetricIndex.NO_COLLISION, MultiMetricIndex.DRIVABLE_AREA],
+            weighted_indices=[],
+        )
         if pdm_result is None:
             return None
 
@@ -72,6 +168,7 @@ class RLScorer(ScorerBase):
             nc = collision_result["nc"]
             max_collision_overlap = collision_result["max_collision_overlap"]
             max_collision_penetration_distance = collision_result["max_collision_penetration_distance"]
+            per_step_collisions = collision_result["per_step_collisions"]
             dac = self._dac_continuous(ego_polygons, scene, rl_config)
             ddc = (
                 self._ddc_continuous(ego_coords, ego_areas, scene, rl_config)
@@ -84,61 +181,115 @@ class RLScorer(ScorerBase):
                 else np.ones(len(batch_waypoints), dtype=np.float64)
             )
             # Raw physics: obstacle and boundary distances + normalization denominators
-            min_obstacle_dist = self._min_obstacle_distance(ego_polygons, scene, rl_config)
-            min_boundary_dist = self._min_boundary_distance(ego_coords, scene, rl_config)
-            mean_obstacle_dist_5m = self._mean_obstacle_distance_within(ego_polygons, scene, rl_config)
+            obstacle_dist_series = self._obstacle_distance_series(ego_polygons, scene, rl_config)
+            min_obstacle_dist = obstacle_dist_series.min(axis=1)
+            obstacle_margin = rl_config.obstacle_clearance_margin
+            obstacle_valid = obstacle_dist_series < obstacle_margin
+            obstacle_counts = obstacle_valid.sum(axis=1)
+            mean_obstacle_dist_5m = np.divide(
+                np.where(obstacle_valid, obstacle_dist_series, 0.0).sum(axis=1),
+                obstacle_counts,
+                out=np.full(len(batch_waypoints), obstacle_margin, dtype=np.float64),
+                where=obstacle_counts > 0,
+            )
+            boundary_dist_series = self._boundary_distance_series_raw(ego_coords, scene)
+            min_boundary_dist = boundary_dist_series.min(axis=1)
             half_lane_w = self._half_lane_width(scene)
         else:
-            nc = self._no_at_fault_collision(simulated_states, ego_polygons, ego_areas, scene)
+            # Discrete mode: V1-aligned binary metrics
+            nc = self._no_at_fault_collision(
+                simulated_states, ego_polygons, ego_areas, scene, use_observation_types=True,
+            )
             dac = self._drivable_area_compliance(ego_areas)
             max_collision_overlap = np.where(nc < 1.0, 1.0 - nc, 0.0)
             max_collision_penetration_distance = np.zeros(len(batch_waypoints), dtype=np.float64)
-            ddc = (
-                self._driving_direction_compliance(ego_coords, ego_areas, scene)
-                if rl_config.ddc_weight > 0.0
-                else np.ones(len(batch_waypoints), dtype=np.float64)
-            )
-            tlc = (
-                self._traffic_light_compliance(ego_polygons, scene)
-                if rl_config.tlc_weight > 0.0
-                else np.ones(len(batch_waypoints), dtype=np.float64)
-            )
+            per_step_collisions = [[None] * ego_polygons.shape[1] for _ in range(len(batch_waypoints))]
+            # V1 computes DDC unconditionally (even though weight=0 in aggregation)
+            ddc = self._driving_direction_compliance(ego_coords, ego_areas, scene)
+            # V1 computes TLC unconditionally
+            tlc = self._traffic_light_compliance(ego_polygons, scene)
             min_obstacle_dist = np.zeros(len(batch_waypoints), dtype=np.float64)
             min_boundary_dist = np.zeros(len(batch_waypoints), dtype=np.float64)
             mean_obstacle_dist_5m = np.full(len(batch_waypoints), 5.0, dtype=np.float64)
+            boundary_dist_series = None
             half_lane_w = 2.0
 
-        # Performance layer: always continuous
+        # Performance layer
         pdm_masked = self._resolve_pdm_masked_progress(scene)
-        ep = self._ep_continuous(
-            ego_coords,
-            scene,
-            rl_config,
-            reference_masked_progress=pdm_masked,
-        )
-        ttc = self._ttc_continuous(simulated_states, ego_coords, ego_areas, scene, rl_config)
+        if rl_config.safety_mode == "discrete":
+            # V1-aligned: v1 progress normalization, binary TTC (1s), binary HC
+            progress_raw = self._progress(ego_coords, scene)
+            ep = self._normalize_progress_v1_inline(progress_raw, nc, dac, pdm_masked)
+            ttc = self._time_to_collision(simulated_states, ego_coords, ego_areas, scene)
+            hc = self._history_comfort(simulated_states, scene, use_past_states=False)
+        else:
+            # Continuous: independent continuous sub-rewards
+            ep = self._ep_continuous(
+                ego_coords,
+                scene,
+                rl_config,
+                reference_masked_progress=pdm_masked,
+            )
+            ttc = self._ttc_continuous(simulated_states, ego_coords, ego_areas, scene, rl_config)
+            hc = self._hc_continuous(simulated_states, scene)
+        progress_per_wp = self._progress_per_waypoint(ego_coords, scene, rl_config)
         lk = (
             self._lk_continuous(ego_coords, ego_areas, scene, rl_config)
             if rl_config.lk_weight > 0.0
             else np.ones(len(batch_waypoints), dtype=np.float64)
         )
-        hc = self._hc_continuous(simulated_states, scene)
+
+        # Standard v1 PDMS monitoring computed from the same simulated states.
+        # This keeps /v1/score/rl useful for one-pass margin filtering: the
+        # top-level RL fields may be continuous rewards, while pdms_* fields are
+        # the discrete NavSim-compatible score and components.
+        if rl_config.safety_mode == "discrete":
+            pdms_nc = nc
+            pdms_dac = dac
+            pdms_ddc = ddc
+            pdms_tlc = tlc
+            pdms_ep = ep
+            pdms_ttc = ttc
+            pdms_hc = hc
+        else:
+            pdms_nc = self._no_at_fault_collision(
+                simulated_states, ego_polygons, ego_areas, scene, use_observation_types=True,
+            )
+            pdms_dac = self._drivable_area_compliance(ego_areas)
+            pdms_ddc = self._driving_direction_compliance(ego_coords, ego_areas, scene)
+            pdms_tlc = self._traffic_light_compliance(ego_polygons, scene)
+            pdms_progress_raw = self._progress(ego_coords, scene)
+            pdms_ep = self._normalize_progress_v1_inline(
+                pdms_progress_raw,
+                pdms_nc,
+                pdms_dac,
+                pdm_masked,
+            )
+            pdms_ttc = self._time_to_collision(simulated_states, ego_coords, ego_areas, scene)
+            pdms_hc = self._history_comfort(simulated_states, scene, use_past_states=False)
+        pdms_lk = self._lane_keeping(ego_coords, ego_areas, scene)
+        pdms_safety_gate = pdms_nc * pdms_dac
+        pdms_perf = (5.0 * pdms_ep + 5.0 * pdms_ttc + 2.0 * pdms_hc) / 12.0
+        pdms_score_arr = pdms_safety_gate * pdms_perf
+
         lat_offset_signed = self._lateral_offset_signed(ego_coords, ego_areas, scene)
         lat_offset_change = self._lateral_offset_change(ego_coords, ego_areas, scene)
         centerline_geom = self._centerline_geometry(ego_coords, ego_areas, scene)
-        boundary_geom = self._boundary_geometry(ego_coords, scene, rl_config)
+        boundary_geom = self._boundary_geometry(ego_coords, scene, rl_config, dists=boundary_dist_series)
         topology_geom = self._topology_occupancy(ego_areas)
 
-        # Discrete mode: raw progress (meters) + safety gate + PDMS monitoring
+        # Current-frame intersection check using ego_state global position
+        ego_pos_global = scene.ego_state[:2].reshape(1, 1, 2)  # (1, 1, 2)
+        ego_now_membership = scene.drivable_area_map.points_in_polygons(ego_pos_global)
+        in_intersection_now = bool(ego_now_membership[0, 0, SemanticMapLayer.INTERSECTION])
+
+        # Discrete mode: raw progress (meters) + safety gate + V1-aligned PDMS
         if rl_config.safety_mode == "discrete":
             raw_progress_meters = self._progress(ego_coords, scene)
             # V1 safety gate: NC × DAC only
             safety_gate_arr = nc * dac
             # Quality-modulated progress: raw_meters × TTC × HC, gated by safety
             raw_progress_gated = raw_progress_meters * safety_gate_arr * ttc * hc
-            # PDMS v1 monitoring: (NC × DAC) × (5*EP + 5*TTC + 2*HC) / 12
-            perf_weighted = (5.0 * ep + 5.0 * ttc + 2.0 * hc) / 12.0
-            pdms_arr = safety_gate_arr * perf_weighted
 
         # Aggregation: soft safety gate × weighted performance average
         safety_product = nc * dac * ddc * tlc
@@ -186,7 +337,10 @@ class RLScorer(ScorerBase):
                 boundary_distance_mean=float(boundary_geom["mean"][i]),
                 boundary_distances=[float(x) for x in boundary_geom["distances"][i].tolist()],
                 boundary_side=boundary_geom["side"][i],
+                nearest_boundary_side=boundary_geom["nearest_side"][i],
+                nearest_boundary_distance=float(boundary_geom["nearest_distance"][i]),
                 in_intersection_fraction=float(topology_geom["in_intersection_fraction"][i]),
+                in_intersection_now=in_intersection_now,
                 oncoming_fraction=float(topology_geom["oncoming_fraction"][i]),
                 non_drivable_fraction=float(topology_geom["non_drivable_fraction"][i]),
                 multiple_lanes_fraction=float(topology_geom["multiple_lanes_fraction"][i]),
@@ -194,12 +348,25 @@ class RLScorer(ScorerBase):
                 oncoming_flags=[bool(x) for x in topology_geom["oncoming_flags"][i].tolist()],
                 non_drivable_flags=[bool(x) for x in topology_geom["non_drivable_flags"][i].tolist()],
                 multiple_lanes_flags=[bool(x) for x in topology_geom["multiple_lanes_flags"][i].tolist()],
+                boundary_sides=boundary_geom["sides_series"][i],
+                collision_per_step=per_step_collisions[i],
+                progress_per_waypoint=progress_per_wp[i],
             )
             if rl_config.safety_mode == "discrete":
                 result_kwargs.update(
                     safety_gate=float(safety_gate_arr[i]),
                     raw_progress=float(raw_progress_gated[i]),
-                    pdms_score=float(pdms_arr[i]),
                 )
+            result_kwargs.update(
+                pdms_score=float(pdms_score_arr[i]),
+                pdms_no_at_fault_collisions=float(pdms_nc[i]),
+                pdms_drivable_area_compliance=float(pdms_dac[i]),
+                pdms_driving_direction_compliance=float(pdms_ddc[i]),
+                pdms_traffic_light_compliance=float(pdms_tlc[i]),
+                pdms_ego_progress=float(pdms_ep[i]),
+                pdms_time_to_collision=float(pdms_ttc[i]),
+                pdms_lane_keeping=float(pdms_lk[i]),
+                pdms_history_comfort=float(pdms_hc[i]),
+            )
             results.append(RLScoringResult(**result_kwargs))
         return results

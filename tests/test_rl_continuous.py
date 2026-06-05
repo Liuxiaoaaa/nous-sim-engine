@@ -340,6 +340,37 @@ class TestNCContinuous:
             f"Discrete NC should be binary-ish, got {result.no_at_fault_collisions}"
         )
 
+    def test_continuous_mode_also_reports_standard_pdms(self):
+        """Continuous RL response carries standard v1 PDMS monitoring fields."""
+        scene = _build_scene(obstacle_x=50.0)
+        traj = _straight(2.0)
+        result = _score_rl(scene, traj)
+        pdm_result = PDMScorer().score(traj, scene)
+        expected_pdms = (
+            result.pdms_no_at_fault_collisions
+            * result.pdms_drivable_area_compliance
+            * (
+                5.0 * result.pdms_ego_progress
+                + 5.0 * result.pdms_time_to_collision
+                + 2.0 * result.pdms_history_comfort
+            )
+            / 12.0
+        )
+        assert result.pdms_score == pytest.approx(expected_pdms)
+        assert result.pdms_score == pytest.approx(pdm_result.pdm_score)
+        assert result.pdms_no_at_fault_collisions == pytest.approx(
+            pdm_result.no_at_fault_collisions
+        )
+        assert result.pdms_drivable_area_compliance == pytest.approx(
+            pdm_result.drivable_area_compliance
+        )
+        assert result.pdms_ego_progress == pytest.approx(pdm_result.ego_progress)
+        assert result.pdms_time_to_collision == pytest.approx(pdm_result.time_to_collision)
+        assert result.pdms_history_comfort == pytest.approx(pdm_result.history_comfort)
+        assert result.pdms_score > 0.0
+        assert result.pdms_no_at_fault_collisions in (0.0, 0.5, 1.0)
+        assert result.pdms_drivable_area_compliance in (0.0, 1.0)
+
     def test_nc_range_is_01(self):
         """NC must be in [0, 1] for all trajectories."""
         scene = _build_scene(obstacle_x=15.0)

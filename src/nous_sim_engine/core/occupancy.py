@@ -5,7 +5,7 @@ from functools import cached_property
 from typing import DefaultDict, List, Sequence
 
 import numpy as np
-import shapely.vectorized
+import shapely
 from shapely import STRtree
 from shapely.geometry import Point, Polygon
 from shapely.geometry.base import BaseGeometry
@@ -161,7 +161,7 @@ class DrivableMap(OccupancyMap):
 
             layer_mask = np.zeros(len(flat_points), dtype=bool)
             for polygon_index in polygon_indices:
-                layer_mask |= shapely.vectorized.contains(
+                layer_mask |= shapely.contains_xy(
                     self._polygons[polygon_index],
                     x_coords,
                     y_coords,

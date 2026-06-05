@@ -232,6 +232,7 @@ def _extract_pdm_trajectory_xy(
 
     MetricCache.trajectory is the explicit PDM closed-loop reference used by V1 scoring.
     We keep sampled[0:num_future_steps+1] so t=0 remains the ego anchor.
+    Includes heading (x, y, heading) to avoid heading derivation errors.
     """
     trajectory = getattr(metric_cache, "trajectory", None)
     if trajectory is None:
@@ -244,8 +245,8 @@ def _extract_pdm_trajectory_xy(
         return None
 
     end_idx = min(num_future_steps + 1, len(sampled))
-    global_xy = np.array(
-        [[s.rear_axle.x, s.rear_axle.y] for s in sampled[0:end_idx]],
+    global_xyh = np.array(
+        [[s.rear_axle.x, s.rear_axle.y, s.rear_axle.heading] for s in sampled[0:end_idx]],
         dtype=np.float64,
     )
 
@@ -255,19 +256,20 @@ def _extract_pdm_trajectory_xy(
     cos_h = np.cos(-ego_h)
     sin_h = np.sin(-ego_h)
 
-    dx = global_xy[:, 0] - ego_x
-    dy = global_xy[:, 1] - ego_y
+    dx = global_xyh[:, 0] - ego_x
+    dy = global_xyh[:, 1] - ego_y
     local_x = dx * cos_h - dy * sin_h
     local_y = dx * sin_h + dy * cos_h
+    local_heading = global_xyh[:, 2] - ego_h
 
-    return np.stack([local_x, local_y], axis=1)
+    return np.stack([local_x, local_y, local_heading], axis=1)
 
 
 def _extract_gt_trajectory_xy(metric_cache: Any) -> np.ndarray | None:
-    """Extract human/open-loop GT trajectory as ego-relative (x, y) waypoints.
+    """Extract human/open-loop GT trajectory as ego-relative waypoints.
 
     NavSim MetricCache.human_trajectory stores local poses at 0.5s spacing.
-    Prefer this human/open-loop source for analysis/debug GT context.
+    Returns (N, 3) with [x, y, heading] when heading is available, (N, 2) otherwise.
     """
     human_trajectory = getattr(metric_cache, "human_trajectory", None)
     poses = getattr(human_trajectory, "poses", None)
@@ -278,15 +280,30 @@ def _extract_gt_trajectory_xy(metric_cache: Any) -> np.ndarray | None:
     if poses.ndim != 2 or poses.shape[0] == 0 or poses.shape[1] < 2:
         return None
 
-    return poses[:, :2].copy()
+    return poses.copy()
 
 
 _AGENT_TYPE_NAMES = {"VEHICLE", "PEDESTRIAN", "BICYCLE", "EGO"}
 
 
 def _extract_track_object_types(metric_cache: Any) -> dict[str, str]:
-    """Build token → 'agent'|'static' mapping from future_tracked_objects."""
+    """Build token → 'agent'|'static' mapping.
+
+    Sources (in priority order):
+    1. observation.unique_objects — covers all tokens the scorer might encounter
+    2. future_tracked_objects — supplementary coverage
+    """
     result: dict[str, str] = {}
+
+    # Primary: observation.unique_objects (same source NavSim uses for collision type)
+    unique_objects = getattr(getattr(metric_cache, "observation", None), "unique_objects", None)
+    if unique_objects is not None:
+        for token, obj in unique_objects.items():
+            obj_type = getattr(obj, "tracked_object_type", None)
+            type_name = obj_type.name if obj_type is not None else "UNKNOWN"
+            result[str(token)] = "agent" if type_name in _AGENT_TYPE_NAMES else "static"
+
+    # Supplementary: future_tracked_objects
     for dt in getattr(metric_cache, "future_tracked_objects", []):
         tracked_objects = getattr(dt, "tracked_objects", None)
         if tracked_objects is None:
@@ -301,24 +318,80 @@ def _extract_track_object_types(metric_cache: Any) -> dict[str, str]:
     return result
 
 
-def _attach_rl_precompute(ctx: SceneContext) -> None:
-    """Populate optional RL continuous precomputed fields for both warm and lazy paths."""
-    if getattr(ctx, "gt_trajectory", None) is None:
-        return
+def _extract_track_speeds(metric_cache: Any) -> dict[str, float]:
+    """Build token → GT speed (m/s) mapping from observation.unique_objects.
 
-    gt_result = None
-    if getattr(ctx, "gt_progress", None) is None or getattr(ctx, "gt_masked_progress", None) is None:
-        from nous_sim_engine.core.scoring.base import ScorerBase
-        gt_result = ScorerBase()._simulate_and_score_gt(ctx)
+    NavSim uses tracked_object.velocity.magnitude() to determine if a track is
+    stopped (threshold 0.05 m/s). We extract this GT value so our collision
+    classification matches NavSim exactly.
+    """
+    result: dict[str, float] = {}
+    unique_objects = getattr(getattr(metric_cache, "observation", None), "unique_objects", None)
+    if unique_objects is None:
+        return result
+    for token, obj in unique_objects.items():
+        velocity = getattr(obj, "velocity", None)
+        if velocity is not None and hasattr(velocity, "magnitude"):
+            result[str(token)] = float(velocity.magnitude())
+        else:
+            # Non-Agent types (StaticObject) are always "stopped"
+            result[str(token)] = 0.0
+    return result
 
-    if gt_result is not None:
-        if ctx.gt_progress is None:
-            ctx.gt_progress = gt_result.progress
-        if getattr(ctx, "gt_masked_progress", None) is None:
-            from nous_sim_engine.core.enums import MultiMetricIndex
-            gt_nc = float(gt_result.multi_metrics[MultiMetricIndex.NO_COLLISION])
-            gt_dac = float(gt_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA])
-            ctx.gt_masked_progress = gt_result.progress * gt_nc * gt_dac
+
+def _attach_rl_precompute(ctx: SceneContext) -> bool:
+    """Populate optional reference progress fields for warm and lazy paths.
+
+    Returns True when the context was mutated.  The boost-cache caller uses this
+    to backfill old pickles that were created before PDM reference fields were
+    persisted.
+    """
+    from nous_sim_engine.core.enums import MultiMetricIndex
+    from nous_sim_engine.core.scoring.base import ScorerBase
+
+    changed = False
+    scorer = ScorerBase()
+    safety_indices = [MultiMetricIndex.NO_COLLISION, MultiMetricIndex.DRIVABLE_AREA]
+
+    if (
+        getattr(ctx, "gt_trajectory", None) is not None
+        and (getattr(ctx, "gt_progress", None) is None or getattr(ctx, "gt_masked_progress", None) is None)
+    ):
+        gt_result = scorer._simulate_and_score_gt(
+            ctx,
+            multi_indices=safety_indices,
+            weighted_indices=[],
+        )
+        if gt_result is not None:
+            if ctx.gt_progress is None:
+                ctx.gt_progress = gt_result.progress
+                changed = True
+            if getattr(ctx, "gt_masked_progress", None) is None:
+                gt_nc = float(gt_result.multi_metrics[MultiMetricIndex.NO_COLLISION])
+                gt_dac = float(gt_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA])
+                ctx.gt_masked_progress = gt_result.progress * gt_nc * gt_dac
+                changed = True
+
+    if (
+        getattr(ctx, "pdm_trajectory", None) is not None
+        and (getattr(ctx, "pdm_progress", None) is None or getattr(ctx, "pdm_masked_progress", None) is None)
+    ):
+        pdm_result = scorer._simulate_and_score_pdm(
+            ctx,
+            multi_indices=safety_indices,
+            weighted_indices=[],
+        )
+        if pdm_result is not None:
+            if ctx.pdm_progress is None:
+                ctx.pdm_progress = pdm_result.progress
+                changed = True
+            if getattr(ctx, "pdm_masked_progress", None) is None:
+                pdm_nc = float(pdm_result.multi_metrics[MultiMetricIndex.NO_COLLISION])
+                pdm_dac = float(pdm_result.multi_metrics[MultiMetricIndex.DRIVABLE_AREA])
+                ctx.pdm_masked_progress = pdm_result.progress * pdm_nc * pdm_dac
+                changed = True
+
+    return changed
 
 
 def metric_cache_to_scene_context(metric_cache: MetricCache, scene_token: str) -> SceneContext:
@@ -347,6 +420,7 @@ def metric_cache_to_scene_context(metric_cache: MetricCache, scene_token: str) -
         gt_trajectory=_extract_gt_trajectory_xy(metric_cache),
         pdm_trajectory=_extract_pdm_trajectory_xy(metric_cache, ego_state_array),
         track_object_types=_extract_track_object_types(metric_cache),
+        track_speeds=_extract_track_speeds(metric_cache),
     )
 
     _attach_rl_precompute(ctx)
@@ -365,7 +439,11 @@ def _load_scene_context_cached(
         boost_path = _boost_cache_path(boost_cache_dir, log_name, token)
         if boost_path.exists():
             ctx = _load_from_boost(boost_path)
-            _attach_rl_precompute(ctx)
+            if _attach_rl_precompute(ctx):
+                try:
+                    _save_to_boost(ctx, boost_path)
+                except Exception:
+                    pass
             return ctx
 
     # L3: original LZMA MetricCache (~1s)
@@ -404,7 +482,18 @@ def get_boost_cache_dir() -> str | None:
 
 
 def get_warmup_stats() -> dict[str, int]:
-    return dict(_warmup_stats)
+    """Return boost cache stats by counting files on disk."""
+    boost_dir = _boost_cache_dir
+    if boost_dir is None:
+        return {"converted": 0, "total": 0}
+    boost_root = Path(boost_dir)
+    if not boost_root.exists():
+        return {"converted": 0, "total": _warmup_stats.get("total", 0)}
+    try:
+        converted = sum(1 for _ in boost_root.glob("*/*.pkl"))
+    except OSError:
+        converted = 0
+    return {"converted": converted, "total": _warmup_stats.get("total", 0)}
 
 
 def _boost_cache_path(boost_dir: str, log_name: str, token: str) -> Path:
@@ -468,7 +557,7 @@ def warmup_boost_cache(source_dir: str, boost_dir: str, num_workers: int = 32) -
     try:
         log_dirs = [p for p in source_root.iterdir() if p.is_dir()]
         estimated_total = len(log_dirs) * 80  # rough estimate: ~80 scenes per log
-        _warmup_stats["total"] = estimated_total
+        _warmup_stats["total"] = _warmup_stats.get("total", 0) + estimated_total
         logger.info("Boost warmup: ~%d scenes estimated (subprocess, %d workers)", estimated_total, num_workers)
     except OSError:
         _warmup_stats["total"] = 0
@@ -526,22 +615,17 @@ log.info('Done: converted=%d, skipped=%d, failed=%d', converted, skipped, failed
         line = line.rstrip()
         if line:
             logger.info("[warmup] %s", line)
-            # Parse progress from log lines
-            if "Progress:" in line or "Done:" in line:
+            # Parse exact total from subprocess "Warmup subprocess: N scenes" line
+            if "Warmup subprocess:" in line:
                 try:
-                    parts = line.split("converted=")[1] if "converted=" in line else ""
-                    if parts:
-                        c_str = parts.split(",")[0]
-                        _warmup_stats["converted"] = int(c_str) + _warmup_stats.get("skipped", 0)
+                    n_str = line.split("Warmup subprocess:")[1].split("scenes")[0].strip()
+                    # Correct the estimate with the actual count from glob
+                    _warmup_stats["total"] = _warmup_stats.get("total", 0) - estimated_total + int(n_str)
                 except (IndexError, ValueError):
                     pass
 
     proc.wait()
-    # Final count from disk
-    boost_root = Path(boost_dir)
-    final_count = sum(1 for _ in boost_root.glob("**/*.pkl"))
-    _warmup_stats["converted"] = final_count
-    logger.info("Boost warmup finished. %d boost files on disk.", final_count)
+    logger.info("Boost warmup finished for %s.", source_dir)
     return get_warmup_stats()
 
 

@@ -167,7 +167,10 @@ class RLScoreResponse(BaseModel):
     boundary_distance_mean: float = 0.0
     boundary_distances: List[float] = []
     boundary_side: str | None = None
+    nearest_boundary_side: str | None = None
+    nearest_boundary_distance: float = 0.0
     in_intersection_fraction: float = 0.0
+    in_intersection_now: bool = False
     oncoming_fraction: float = 0.0
     non_drivable_fraction: float = 0.0
     multiple_lanes_fraction: float = 0.0
@@ -175,24 +178,37 @@ class RLScoreResponse(BaseModel):
     oncoming_flags: List[bool] = []
     non_drivable_flags: List[bool] = []
     multiple_lanes_flags: List[bool] = []
+    boundary_sides: List[Optional[str]] = []
+    collision_per_step: List[Optional[Dict[str, object]]] = []
+    progress_per_waypoint: List[float] = []
     safety_gate: float = 1.0
     raw_progress: float = 0.0
     pdms_score: float = 0.0
+    pdms_no_at_fault_collisions: float = 1.0
+    pdms_drivable_area_compliance: float = 1.0
+    pdms_driving_direction_compliance: float = 1.0
+    pdms_traffic_light_compliance: float = 1.0
+    pdms_ego_progress: float = 0.0
+    pdms_time_to_collision: float = 1.0
+    pdms_lane_keeping: float = 1.0
+    pdms_history_comfort: float = 1.0
     sub_rewards: Dict[str, float] = {}
     error: str | None = None
 
     @classmethod
     def from_result(cls, result: RLScoringResult) -> "RLScoreResponse":
         return cls(
-            rl_score=_round2(result.rl_score),
-            no_at_fault_collisions=_round2(result.no_at_fault_collisions),
-            drivable_area_compliance=_round2(result.drivable_area_compliance),
-            driving_direction_compliance=_round2(result.driving_direction_compliance),
-            traffic_light_compliance=_round2(result.traffic_light_compliance),
-            ego_progress=_round2(result.ego_progress),
-            time_to_collision=_round2(result.time_to_collision),
-            lane_keeping=_round2(result.lane_keeping),
-            history_comfort=_round2(result.history_comfort),
+            # Core metrics: full precision for V1-aligned PDMS compatibility
+            rl_score=float(result.rl_score),
+            no_at_fault_collisions=float(result.no_at_fault_collisions),
+            drivable_area_compliance=float(result.drivable_area_compliance),
+            driving_direction_compliance=float(result.driving_direction_compliance),
+            traffic_light_compliance=float(result.traffic_light_compliance),
+            ego_progress=float(result.ego_progress),
+            time_to_collision=float(result.time_to_collision),
+            lane_keeping=float(result.lane_keeping),
+            history_comfort=float(result.history_comfort),
+            # Physics diagnostics: round to 2 decimals for readability
             max_collision_overlap=_round2(result.max_collision_overlap),
             max_collision_penetration_distance=_round2(result.max_collision_penetration_distance),
             min_obstacle_distance=_round2(result.min_obstacle_distance),
@@ -212,7 +228,10 @@ class RLScoreResponse(BaseModel):
             boundary_distance_mean=_round2(result.boundary_distance_mean),
             boundary_distances=_round2_list(result.boundary_distances),
             boundary_side=result.boundary_side,
+            nearest_boundary_side=result.nearest_boundary_side,
+            nearest_boundary_distance=_round2(result.nearest_boundary_distance),
             in_intersection_fraction=_round2(result.in_intersection_fraction),
+            in_intersection_now=result.in_intersection_now,
             oncoming_fraction=_round2(result.oncoming_fraction),
             non_drivable_fraction=_round2(result.non_drivable_fraction),
             multiple_lanes_fraction=_round2(result.multiple_lanes_fraction),
@@ -220,10 +239,22 @@ class RLScoreResponse(BaseModel):
             oncoming_flags=result.oncoming_flags,
             non_drivable_flags=result.non_drivable_flags,
             multiple_lanes_flags=result.multiple_lanes_flags,
-            safety_gate=_round2(result.safety_gate),
-            raw_progress=_round2(result.raw_progress),
-            pdms_score=_round2(result.pdms_score),
-            sub_rewards={k: _round2(v) for k, v in result.sub_rewards().items()},
+            boundary_sides=result.boundary_sides,
+            collision_per_step=result.collision_per_step,
+            progress_per_waypoint=_round2_list(result.progress_per_waypoint),
+            # Standard v1 PDMS monitoring fields: full precision
+            safety_gate=float(result.safety_gate),
+            raw_progress=float(result.raw_progress),
+            pdms_score=float(result.pdms_score),
+            pdms_no_at_fault_collisions=float(result.pdms_no_at_fault_collisions),
+            pdms_drivable_area_compliance=float(result.pdms_drivable_area_compliance),
+            pdms_driving_direction_compliance=float(result.pdms_driving_direction_compliance),
+            pdms_traffic_light_compliance=float(result.pdms_traffic_light_compliance),
+            pdms_ego_progress=float(result.pdms_ego_progress),
+            pdms_time_to_collision=float(result.pdms_time_to_collision),
+            pdms_lane_keeping=float(result.pdms_lane_keeping),
+            pdms_history_comfort=float(result.pdms_history_comfort),
+            sub_rewards={k: float(v) for k, v in result.sub_rewards().items()},
             error=result.error,
         )
 

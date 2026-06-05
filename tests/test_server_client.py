@@ -502,6 +502,51 @@ class TestSchemaValidation:
 class TestDiscreteConsistency:
     """Discrete RL safety sub-metrics should match PDM sub-metrics."""
 
+    def test_rl_pdms_monitor_matches_v1_score_for_same_trajectory(
+        self,
+        app_and_client,
+        safe_trajectory,
+        offroad_trajectory,
+    ):
+        metric_pairs = [
+            ("pdm_score", "pdms_score"),
+            ("no_at_fault_collisions", "pdms_no_at_fault_collisions"),
+            ("drivable_area_compliance", "pdms_drivable_area_compliance"),
+            ("driving_direction_compliance", "pdms_driving_direction_compliance"),
+            ("traffic_light_compliance", "pdms_traffic_light_compliance"),
+            ("ego_progress", "pdms_ego_progress"),
+            ("time_to_collision", "pdms_time_to_collision"),
+            ("lane_keeping", "pdms_lane_keeping"),
+            ("history_comfort", "pdms_history_comfort"),
+        ]
+
+        for trajectory in [safe_trajectory, offroad_trajectory]:
+            pdm_resp = app_and_client.post("/v1/score", json={
+                "trajectory": trajectory,
+                "scene_token": SCENE_TOKEN,
+                "log_name": LOG_NAME,
+                "dataset": DATASET,
+            })
+            rl_resp = app_and_client.post("/v1/score/rl", json={
+                "trajectory": trajectory,
+                "scene_token": SCENE_TOKEN,
+                "log_name": LOG_NAME,
+                "dataset": DATASET,
+                "scoring_mode": "continuous",
+            })
+
+            assert pdm_resp.status_code == 200
+            assert rl_resp.status_code == 200
+            pdm = pdm_resp.json()
+            rl = rl_resp.json()
+            assert pdm["error"] is None
+            assert rl["error"] is None
+
+            for pdm_key, rl_key in metric_pairs:
+                assert rl[rl_key] == pytest.approx(pdm[pdm_key]), (
+                    f"{pdm_key}: PDM={pdm[pdm_key]} vs RL monitor={rl[rl_key]}"
+                )
+
     def test_discrete_matches_pdm_safety(self, app_and_client, safe_trajectory):
         pdm_resp = app_and_client.post("/v1/score", json={
             "trajectory": safe_trajectory,
@@ -529,4 +574,3 @@ class TestDiscreteConsistency:
         # while PDM uses binary _time_to_collision. This is by design — RL TTC is always continuous.
         # Both should be in [0, 1].
         assert 0.0 <= rl["time_to_collision"] <= 1.0
-

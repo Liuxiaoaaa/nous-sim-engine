@@ -146,7 +146,11 @@ class PDMScorerV1(ScorerBase):
         if scene.pdm_masked_progress is not None:
             return scene.pdm_masked_progress
 
-        pdm_result = self._simulate_and_score_pdm(scene)
+        pdm_result = self._simulate_and_score_pdm(
+            scene,
+            multi_indices=[MultiMetricIndex.NO_COLLISION, MultiMetricIndex.DRIVABLE_AREA],
+            weighted_indices=[],
+        )
         if pdm_result is None:
             return None
 

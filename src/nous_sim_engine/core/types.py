@@ -50,6 +50,7 @@ class SceneContext:
     pdm_progress: Optional[float] = None  # precomputed PDM centerline progress (raw official v1 reference)
     pdm_masked_progress: Optional[float] = None  # pdm_progress × pdm_NC × pdm_DAC (official v1 reference)
     track_object_types: Dict[str, str] = field(default_factory=dict)  # token → "agent" | "static"
+    track_speeds: Dict[str, float] = field(default_factory=dict)  # token → GT speed (m/s) from annotation
 
 
 @dataclass
@@ -65,7 +66,7 @@ class ScoringResult:
     lane_keeping: float = 1.0
     history_comfort: float = 1.0
     error: Optional[str] = None
-    human_penalty_applied: Optional[List[str]] = None  # metric names overridden by human filter
+    human_penalty_applied: Optional[List[str]] = None
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -110,7 +111,10 @@ class RLScoringResult:
     boundary_distance_mean: float = 0.0
     boundary_distances: List[float] = field(default_factory=list)
     boundary_side: Optional[str] = None
+    nearest_boundary_side: Optional[str] = None
+    nearest_boundary_distance: float = 0.0
     in_intersection_fraction: float = 0.0
+    in_intersection_now: bool = False
     oncoming_fraction: float = 0.0
     non_drivable_fraction: float = 0.0
     multiple_lanes_fraction: float = 0.0
@@ -118,10 +122,23 @@ class RLScoringResult:
     oncoming_flags: List[bool] = field(default_factory=list)
     non_drivable_flags: List[bool] = field(default_factory=list)
     multiple_lanes_flags: List[bool] = field(default_factory=list)
+    # Per-step directional diagnostics
+    boundary_sides: List[Optional[str]] = field(default_factory=list)  # per-step: "left"/"right"/None (only when off-road)
+    collision_per_step: List[Optional[dict]] = field(default_factory=list)  # per-step: {"direction": ..., "penetration": ...} or None
+    # Per-waypoint progress
+    progress_per_waypoint: List[float] = field(default_factory=list)  # 8 values: pred_cumulative[i] / pdm_cumulative[i]
     # Discrete mode: GRPO reward signals
     safety_gate: float = 1.0       # NC × DAC × DDC × TLC binary product
     raw_progress: float = 0.0      # centerline progress in meters, gated by safety
-    pdms_score: float = 0.0        # standard PDMS (GT-normalized), for monitoring only
+    pdms_score: float = 0.0        # standard v1 PDMS, for monitoring / filtering only
+    pdms_no_at_fault_collisions: float = 1.0
+    pdms_drivable_area_compliance: float = 1.0
+    pdms_driving_direction_compliance: float = 1.0
+    pdms_traffic_light_compliance: float = 1.0
+    pdms_ego_progress: float = 0.0
+    pdms_time_to_collision: float = 1.0
+    pdms_lane_keeping: float = 1.0
+    pdms_history_comfort: float = 1.0
     error: Optional[str] = None
 
     def to_dict(self) -> dict:
