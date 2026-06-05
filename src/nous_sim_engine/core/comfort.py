@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+"""Comfort metrics aligned with NavSim official pdm_comfort_metrics.py.
+
+NavSim approach:
+- Acceleration: read directly from state array (ACCELERATION_X/Y), savgol-smooth
+- Jerk: savgol-smooth acceleration first (window=8), then savgol derivative
+- Yaw rate/accel: savgol derivative of phase-unwrapped heading (window=5 always)
+- Bounds: strict inequality (> / <), matching NavSim's _within_bound
+- Round to 8 decimals after each signal extraction
+"""
+
 import numpy as np
 from scipy.signal import savgol_filter
 
@@ -15,154 +25,271 @@ COMFORT_THRESHOLDS = {
     "max_abs_yaw_rate": 0.95,
 }
 
-# Default rear-axle to center-of-vehicle offset (Pacifica)
-_DEFAULT_REAR_AXLE_TO_CENTER = 1.461
+
+# ── NavSim-aligned primitive operations ──────────────────────────────
 
 
-def _safe_savgol(values: np.ndarray, window_length: int, polyorder: int) -> np.ndarray:
-    """Apply savgol_filter with safe window/polyorder handling for short sequences."""
-    n = len(values)
-    if n < 3:
-        return values.astype(np.float64, copy=True)
-    w = min(window_length, n if n % 2 == 1 else n - 1)
-    if w < 3:
-        return values.astype(np.float64, copy=True)
-    p = min(polyorder, w - 1)
-    return savgol_filter(values, window_length=w, polyorder=p, mode="interp")
+def _phase_unwrap(headings: np.ndarray) -> np.ndarray:
+    """Phase-unwrap headings so successive differences are <= pi.
 
-
-def _savgol_derivative(values: np.ndarray, dt: float, window_length: int, polyorder: int) -> np.ndarray:
-    """Compute 1st derivative using savgol_filter (matches official NavSim approach)."""
-    n = len(values)
-    if n < 3:
-        return np.zeros_like(values, dtype=np.float64)
-    w = min(window_length, n if n % 2 == 1 else n - 1)
-    if w < 3:
-        return np.gradient(values, dt)
-    p = min(polyorder, w - 1)
-    return savgol_filter(values, window_length=w, polyorder=p, deriv=1, delta=dt, mode="interp")
-
-
-def _rear_axle_to_center(states: np.ndarray, rear_axle_to_center: float) -> tuple[np.ndarray, np.ndarray]:
-    """Shift positions from rear-axle to center-of-vehicle.
-
-    Returns center (x, y) arrays.
+    Matches NavSim's _phase_unwrap exactly.
     """
-    headings = states[:, StateIndex.HEADING]
-    center_x = states[:, StateIndex.X] + rear_axle_to_center * np.cos(headings)
-    center_y = states[:, StateIndex.Y] + rear_axle_to_center * np.sin(headings)
-    return center_x, center_y
+    two_pi = 2.0 * np.pi
+    adjustments = np.zeros_like(headings)
+    adjustments[..., 1:] = np.cumsum(
+        np.round(np.diff(headings, axis=-1) / two_pi), axis=-1,
+    )
+    return headings - two_pi * adjustments
 
 
-def _compute_comfort_signals(
+def _extract_ego_acceleration(
     states: np.ndarray,
-    time_points_s: np.ndarray,
-    rear_axle_to_center: float = _DEFAULT_REAR_AXLE_TO_CENTER,
-) -> dict[str, np.ndarray]:
-    """Compute all comfort signals aligned with official NavSim.
+    acceleration_coordinate: str,
+    decimals: int = 8,
+    poly_order: int = 2,
+    window_length: int = 8,
+) -> np.ndarray:
+    """Extract smoothed acceleration from state array.
 
-    Official approach:
-    - lon/lat acceleration: from center-of-vehicle coordinates, savgol smoothed (window=8, poly=2)
-    - lon jerk: derivative of center-state lon acceleration (savgol window=15, poly=2)
-    - magnitude jerk: from rear-axle acceleration magnitude (savgol window=15, poly=2)
-    - yaw rate/accel: from heading (savgol derivative window=15, poly=2)
+    Matches NavSim's _extract_ego_acceleration:
+    - Reads acceleration directly from state (not derived from position)
+    - Applies savgol_filter for smoothing
     """
-    dt = float(np.median(np.diff(time_points_s)))
+    if acceleration_coordinate == "x":
+        acceleration = states[..., StateIndex.ACCELERATION_X].copy()
+    elif acceleration_coordinate == "y":
+        acceleration = states[..., StateIndex.ACCELERATION_Y].copy()
+    elif acceleration_coordinate == "magnitude":
+        acceleration = np.hypot(
+            states[..., StateIndex.ACCELERATION_X],
+            states[..., StateIndex.ACCELERATION_Y],
+        )
+    else:
+        raise ValueError(f"Unknown acceleration_coordinate: {acceleration_coordinate}")
 
-    # Center-of-vehicle positions for lon/lat acceleration
-    center_x, center_y = _rear_axle_to_center(states, rear_axle_to_center)
-    headings = np.unwrap(states[:, StateIndex.HEADING])
+    n_time = states.shape[-2]
+    w = min(window_length, n_time)
+    # savgol requires odd window >= polyorder + 1
+    if w % 2 == 0:
+        w = max(w - 1, 1)
+    if w >= poly_order + 1:
+        acceleration = savgol_filter(
+            acceleration, polyorder=poly_order, window_length=w, axis=-1,
+        )
+    return np.round(acceleration, decimals=decimals)
 
-    # Velocity from center positions (savgol derivative, window=8, poly=2)
-    vx = _savgol_derivative(center_x, dt, window_length=8, polyorder=2)
-    vy = _savgol_derivative(center_y, dt, window_length=8, polyorder=2)
 
-    # Project to lon/lat frame
-    cos_h = np.cos(headings)
-    sin_h = np.sin(headings)
-    lon_vel = cos_h * vx + sin_h * vy
-    lat_vel = -sin_h * vx + cos_h * vy
+def _approximate_derivatives(
+    y: np.ndarray,
+    time_steps_s: np.ndarray,
+    window_length: int = 5,
+    poly_order: int = 2,
+    deriv_order: int = 1,
+    axis: int = -1,
+) -> np.ndarray:
+    """Savgol derivative matching NavSim's _approximate_derivatives."""
+    n = y.shape[axis]
+    w = min(window_length, n)
+    if w % 2 == 0:
+        w = max(w - 1, 1)
+    if not (poly_order < w):
+        raise ValueError(f"{poly_order} < {w} does not hold!")
 
-    # Acceleration from center-state velocity (savgol derivative, window=8, poly=2)
-    lon_accel = _savgol_derivative(lon_vel, dt, window_length=8, polyorder=2)
-    lat_accel = _savgol_derivative(lat_vel, dt, window_length=8, polyorder=2)
+    dx = np.diff(time_steps_s, axis=-1)
+    dx = dx.mean()
 
-    # Lon jerk from center-state (savgol derivative, window=15, poly=2)
-    lon_jerk = _savgol_derivative(lon_accel, dt, window_length=15, polyorder=2)
+    return savgol_filter(
+        y, polyorder=poly_order, window_length=w, deriv=deriv_order, delta=dx, axis=axis,
+    )
 
-    # Magnitude jerk from rear-axle acceleration (official uses rear-axle for magnitude)
-    rear_ax = _safe_savgol(states[:, StateIndex.ACCELERATION_X], window_length=8, polyorder=2)
-    rear_ay = _safe_savgol(states[:, StateIndex.ACCELERATION_Y], window_length=8, polyorder=2)
-    accel_magnitude = np.hypot(rear_ax, rear_ay)
-    jerk_magnitude = _savgol_derivative(accel_magnitude, dt, window_length=15, polyorder=2)
 
-    # Yaw rate and acceleration (savgol derivative, window=15, poly=2)
-    yaw_rate = _savgol_derivative(headings, dt, window_length=15, polyorder=2)
-    yaw_accel = _savgol_derivative(yaw_rate, dt, window_length=15, polyorder=2)
+def _extract_ego_jerk(
+    states: np.ndarray,
+    acceleration_coordinate: str,
+    time_steps_s: np.ndarray,
+    decimals: int = 8,
+    deriv_order: int = 1,
+    poly_order: int = 2,
+    window_length: int = 15,
+) -> np.ndarray:
+    """Extract jerk: smooth accel first (default window=8), then derivative.
 
-    return {
-        "lon_accel": lon_accel,
-        "lat_accel": lat_accel,
-        "lon_jerk": lon_jerk,
-        "jerk_magnitude": jerk_magnitude,
-        "yaw_rate": yaw_rate,
-        "yaw_accel": yaw_accel,
-    }
+    Matches NavSim's _extract_ego_jerk.
+    """
+    n_time = states.shape[-2]
+    ego_acceleration = _extract_ego_acceleration(
+        states, acceleration_coordinate=acceleration_coordinate,
+    )
+    jerk = _approximate_derivatives(
+        ego_acceleration,
+        time_steps_s,
+        deriv_order=deriv_order,
+        poly_order=poly_order,
+        window_length=min(window_length, n_time),
+    )
+    return np.round(jerk, decimals=decimals)
+
+
+def _extract_ego_yaw_rate(
+    states: np.ndarray,
+    time_steps_s: np.ndarray,
+    deriv_order: int = 1,
+    poly_order: int = 2,
+    decimals: int = 8,
+    window_length: int = 15,  # noqa: ARG001 — accepted but NOT forwarded (NavSim bug)
+) -> np.ndarray:
+    """Extract yaw rate/accel from heading.
+
+    IMPORTANT: NavSim's _extract_ego_yaw_rate has window_length param but does NOT
+    forward it to _approximate_derivatives, so yaw rate/accel always use default
+    window=5. We replicate this behavior exactly.
+    """
+    ego_headings = states[..., StateIndex.HEADING]
+    ego_yaw_rate = _approximate_derivatives(
+        _phase_unwrap(ego_headings),
+        time_steps_s,
+        deriv_order=deriv_order,
+        poly_order=poly_order,
+        # window_length NOT forwarded — uses default=5 (NavSim behavior)
+    )
+    return np.round(ego_yaw_rate, decimals=decimals)
+
+
+# ── Bound checks (strict inequality, matching NavSim) ───────────────
+
+
+def _within_bound(
+    metric: np.ndarray,
+    min_bound: float | None = None,
+    max_bound: float | None = None,
+) -> np.ndarray:
+    """Check if all values along last axis are strictly within bounds.
+
+    NavSim uses strict inequality: (metric > min_bound) & (metric < max_bound).
+    """
+    lo = min_bound if min_bound is not None else float(-np.inf)
+    hi = max_bound if max_bound is not None else float(np.inf)
+    return np.all((metric > lo) & (metric < hi), axis=-1)
+
+
+# ── Per-metric compute functions (NavSim signature) ─────────────────
+
+
+def _compute_lon_acceleration(states: np.ndarray, time_steps_s: np.ndarray) -> np.ndarray:
+    n_time = states.shape[-2]
+    lon_acceleration = _extract_ego_acceleration(states, "x", window_length=n_time)
+    return _within_bound(lon_acceleration, min_bound=-4.05, max_bound=2.40)
+
+
+def _compute_lat_acceleration(states: np.ndarray, time_steps_s: np.ndarray) -> np.ndarray:
+    n_time = states.shape[-2]
+    lat_acceleration = _extract_ego_acceleration(states, "y", window_length=n_time)
+    return _within_bound(lat_acceleration, min_bound=-4.89, max_bound=4.89)
+
+
+def _compute_jerk_metric(states: np.ndarray, time_steps_s: np.ndarray) -> np.ndarray:
+    n_time = states.shape[-2]
+    jerk = _extract_ego_jerk(states, "magnitude", time_steps_s, window_length=n_time)
+    return _within_bound(jerk, min_bound=-8.37, max_bound=8.37)
+
+
+def _compute_lon_jerk_metric(states: np.ndarray, time_steps_s: np.ndarray) -> np.ndarray:
+    n_time = states.shape[-2]
+    lon_jerk = _extract_ego_jerk(states, "x", time_steps_s, window_length=n_time)
+    return _within_bound(lon_jerk, min_bound=-4.13, max_bound=4.13)
+
+
+def _compute_yaw_accel(states: np.ndarray, time_steps_s: np.ndarray) -> np.ndarray:
+    n_time = states.shape[-2]
+    yaw_accel = _extract_ego_yaw_rate(
+        states, time_steps_s, deriv_order=2, poly_order=3, window_length=n_time,
+    )
+    return _within_bound(yaw_accel, min_bound=-1.93, max_bound=1.93)
+
+
+def _compute_yaw_rate(states: np.ndarray, time_steps_s: np.ndarray) -> np.ndarray:
+    n_time = states.shape[-2]
+    yaw_rate = _extract_ego_yaw_rate(states, time_steps_s, window_length=n_time)
+    return _within_bound(yaw_rate, min_bound=-0.95, max_bound=0.95)
+
+
+# ── Public API ───────────────────────────────────────────────────────
 
 
 def ego_is_comfortable(
     states: np.ndarray,
     time_points_s: np.ndarray,
-    rear_axle_to_center: float = _DEFAULT_REAR_AXLE_TO_CENTER,
 ) -> bool:
-    """Evaluate comfort thresholds on a single state trajectory (NavSim-aligned)."""
+    """Evaluate comfort thresholds (NavSim-aligned, batch or single).
+
+    Accepts states with shape [T, 11] (single) or [B, T, 11] (batch).
+    For batch input, returns True only if ALL proposals are comfortable.
+    """
     states = np.asarray(states, dtype=np.float64)
     time_points_s = np.asarray(time_points_s, dtype=np.float64)
 
-    if states.ndim != 2 or states.shape[1] != StateIndex.size():
-        raise ValueError(f"states must have shape [T, {StateIndex.size()}], got {states.shape}")
-    if len(time_points_s) < 3:
+    if states.ndim == 2:
+        states = states[None, ...]  # [1, T, 11]
+
+    n_batch, n_time, n_states = states.shape
+    assert n_time == len(time_points_s)
+    assert n_states == StateIndex.size()
+
+    if n_time < 3:
         return True
 
-    s = _compute_comfort_signals(states, time_points_s, rear_axle_to_center)
+    comfort_fns = [
+        _compute_lon_acceleration,
+        _compute_lat_acceleration,
+        _compute_jerk_metric,
+        _compute_lon_jerk_metric,
+        _compute_yaw_accel,
+        _compute_yaw_rate,
+    ]
+    results = np.zeros((n_batch, len(comfort_fns)), dtype=np.bool_)
+    for idx, fn in enumerate(comfort_fns):
+        results[:, idx] = fn(states, time_points_s)
 
-    return bool(
-        np.all(np.abs(s["jerk_magnitude"]) <= COMFORT_THRESHOLDS["max_abs_mag_jerk"])
-        and np.all(np.abs(s["lat_accel"]) <= COMFORT_THRESHOLDS["max_abs_lat_accel"])
-        and np.all(s["lon_accel"] <= COMFORT_THRESHOLDS["max_lon_accel"])
-        and np.all(s["lon_accel"] >= COMFORT_THRESHOLDS["min_lon_accel"])
-        and np.all(np.abs(s["yaw_accel"]) <= COMFORT_THRESHOLDS["max_abs_yaw_accel"])
-        and np.all(np.abs(s["lon_jerk"]) <= COMFORT_THRESHOLDS["max_abs_lon_jerk"])
-        and np.all(np.abs(s["yaw_rate"]) <= COMFORT_THRESHOLDS["max_abs_yaw_rate"])
-    )
+    return bool(np.all(results))
 
 
 def ego_comfort_violation(
     states: np.ndarray,
     time_points_s: np.ndarray,
-    rear_axle_to_center: float = _DEFAULT_REAR_AXLE_TO_CENTER,
 ) -> float:
     """Continuous comfort metric: 1.0 = fully comfortable, 0.0 = severely violated.
 
-    Computes the max violation ratio across all 7 thresholds and all timesteps,
-    then maps to [0, 1] via ``1 - clip(max_ratio, 0, 1)``.
+    Uses NavSim-aligned signal extraction, then maps max violation ratio to [0, 1].
     """
     states = np.asarray(states, dtype=np.float64)
     time_points_s = np.asarray(time_points_s, dtype=np.float64)
 
-    if len(time_points_s) < 3:
+    if states.ndim == 2:
+        states = states[None, ...]
+
+    n_batch, n_time, n_states = states.shape
+    if n_time < 3:
         return 1.0
 
-    s = _compute_comfort_signals(states, time_points_s, rear_axle_to_center)
+    # Extract signals using NavSim-aligned functions
+    lon_accel = _extract_ego_acceleration(states, "x", window_length=n_time)
+    lat_accel = _extract_ego_acceleration(states, "y", window_length=n_time)
+    mag_jerk = _extract_ego_jerk(states, "magnitude", time_points_s, window_length=n_time)
+    lon_jerk = _extract_ego_jerk(states, "x", time_points_s, window_length=n_time)
+    yaw_accel = _extract_ego_yaw_rate(
+        states, time_points_s, deriv_order=2, poly_order=3, window_length=n_time,
+    )
+    yaw_rate = _extract_ego_yaw_rate(states, time_points_s, window_length=n_time)
 
+    t = COMFORT_THRESHOLDS
     violation_ratios = [
-        np.max(np.abs(s["jerk_magnitude"]) / COMFORT_THRESHOLDS["max_abs_mag_jerk"] - 1.0),
-        np.max(np.abs(s["lat_accel"]) / COMFORT_THRESHOLDS["max_abs_lat_accel"] - 1.0),
-        np.max(s["lon_accel"] / COMFORT_THRESHOLDS["max_lon_accel"] - 1.0),
-        np.max(-s["lon_accel"] / (-COMFORT_THRESHOLDS["min_lon_accel"]) - 1.0),
-        np.max(np.abs(s["yaw_accel"]) / COMFORT_THRESHOLDS["max_abs_yaw_accel"] - 1.0),
-        np.max(np.abs(s["lon_jerk"]) / COMFORT_THRESHOLDS["max_abs_lon_jerk"] - 1.0),
-        np.max(np.abs(s["yaw_rate"]) / COMFORT_THRESHOLDS["max_abs_yaw_rate"] - 1.0),
+        np.max(np.abs(mag_jerk) / t["max_abs_mag_jerk"] - 1.0),
+        np.max(np.abs(lat_accel) / t["max_abs_lat_accel"] - 1.0),
+        np.max(lon_accel / t["max_lon_accel"] - 1.0),
+        np.max(-lon_accel / (-t["min_lon_accel"]) - 1.0),
+        np.max(np.abs(yaw_accel) / t["max_abs_yaw_accel"] - 1.0),
+        np.max(np.abs(lon_jerk) / t["max_abs_lon_jerk"] - 1.0),
+        np.max(np.abs(yaw_rate) / t["max_abs_yaw_rate"] - 1.0),
     ]
 
     max_violation = max(0.0, float(max(violation_ratios)))
