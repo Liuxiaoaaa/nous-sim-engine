@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import lzma
 import os
 import pickle
+import socket
+import subprocess
+import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -15,6 +20,8 @@ import numpy as np
 from nous_sim_engine.core.geometry import PDMPath
 from nous_sim_engine.core.observation import PDMObservation
 from nous_sim_engine.core.occupancy import DrivableMap, OccupancyMap
+from nous_sim_engine.core.enums import MultiMetricIndex
+from nous_sim_engine.core.scoring.base import ScorerBase
 from nous_sim_engine.core.types import SceneContext
 
 logger = logging.getLogger(__name__)
@@ -213,14 +220,11 @@ def _extract_log_name_from_path(file_path: str | Path) -> str | None:
 
     Path format: .../metric_cache*/{log_name}/{scenario_type}/{token}/metric_cache.pkl
     """
-    try:
-        parts = Path(file_path).parts
-        # Find 'metric_cache' in path, the next part is log_name
-        for i, p in enumerate(parts):
-            if "metric_cache" in p and i + 1 < len(parts):
-                return parts[i + 1]
-    except Exception:
-        pass
+    parts = Path(file_path).parts
+    # Find 'metric_cache' in path, the next part is log_name
+    for i, p in enumerate(parts):
+        if "metric_cache" in p and i + 1 < len(parts):
+            return parts[i + 1]
     return None
 
 
@@ -237,10 +241,7 @@ def _extract_pdm_trajectory_xy(
     trajectory = getattr(metric_cache, "trajectory", None)
     if trajectory is None:
         return None
-    try:
-        sampled = list(trajectory.get_sampled_trajectory())
-    except Exception:
-        return None
+    sampled = list(trajectory.get_sampled_trajectory())
     if len(sampled) < 2:
         return None
 
@@ -346,9 +347,6 @@ def _attach_rl_precompute(ctx: SceneContext) -> bool:
     to backfill old pickles that were created before PDM reference fields were
     persisted.
     """
-    from nous_sim_engine.core.enums import MultiMetricIndex
-    from nous_sim_engine.core.scoring.base import ScorerBase
-
     changed = False
     scorer = ScorerBase()
     safety_indices = [MultiMetricIndex.NO_COLLISION, MultiMetricIndex.DRIVABLE_AREA]
@@ -442,8 +440,12 @@ def _load_scene_context_cached(
             if _attach_rl_precompute(ctx):
                 try:
                     _save_to_boost(ctx, boost_path)
-                except Exception:
-                    pass
+                except OSError:
+                    logger.warning(
+                        "Failed to update boost cache with backfilled reference metrics: %s",
+                        boost_path,
+                        exc_info=True,
+                    )
             return ctx
 
     # L3: original LZMA MetricCache (~1s)
@@ -454,8 +456,13 @@ def _load_scene_context_cached(
     if boost_cache_dir is not None:
         try:
             _save_to_boost(ctx, _boost_cache_path(boost_cache_dir, log_name, token))
-        except Exception:
-            pass  # best-effort
+        except OSError:
+            logger.warning(
+                "Failed to write boost cache for %s/%s",
+                log_name,
+                token,
+                exc_info=True,
+            )
 
     return ctx
 
@@ -482,22 +489,88 @@ def get_boost_cache_dir() -> str | None:
 
 
 def get_warmup_stats() -> dict[str, int]:
-    """Return boost cache stats by counting files on disk."""
+    """Return boost cache stats without recursively scanning boost files.
+
+    Warmup workers write one small JSON progress file per source dataset.  Health checks
+    read those files instead of globbing tens of thousands of boost pickles.
+    """
     boost_dir = _boost_cache_dir
     if boost_dir is None:
         return {"converted": 0, "total": 0}
     boost_root = Path(boost_dir)
     if not boost_root.exists():
         return {"converted": 0, "total": _warmup_stats.get("total", 0)}
+
+    aggregate = {"converted": 0, "skipped": 0, "failed": 0, "total": 0}
+    progress_dir = _boost_progress_dir(boost_root)
     try:
-        converted = sum(1 for _ in boost_root.glob("*/*.pkl"))
+        progress_files = list(progress_dir.glob("*.json"))
     except OSError:
-        converted = 0
-    return {"converted": converted, "total": _warmup_stats.get("total", 0)}
+        progress_files = []
+
+    for progress_file in progress_files:
+        try:
+            data = json.loads(progress_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        for key in aggregate:
+            aggregate[key] += int(data.get(key, 0) or 0)
+
+    if aggregate["total"] == 0:
+        aggregate.update({k: int(v) for k, v in _warmup_stats.items()})
+    return aggregate
 
 
 def _boost_cache_path(boost_dir: str, log_name: str, token: str) -> Path:
     return Path(boost_dir) / log_name / f"{token}.pkl"
+
+
+def _boost_meta_dir(boost_root: Path) -> Path:
+    return boost_root / ".warmup"
+
+
+def _boost_progress_dir(boost_root: Path) -> Path:
+    return _boost_meta_dir(boost_root) / "progress"
+
+
+def _source_key(source_dir: str | Path) -> str:
+    source = str(Path(source_dir).resolve())
+    return hashlib.sha1(source.encode("utf-8")).hexdigest()[:16]
+
+
+def _lock_path(boost_dir: str | Path, source_dir: str | Path) -> Path:
+    return _boost_meta_dir(Path(boost_dir)) / f"{_source_key(source_dir)}.lock"
+
+
+def _progress_path(boost_dir: str | Path, source_dir: str | Path) -> Path:
+    return _boost_progress_dir(Path(boost_dir)) / f"{_source_key(source_dir)}.json"
+
+
+def _write_progress(
+    progress_path: Path,
+    *,
+    source_dir: str,
+    status: str,
+    total: int,
+    converted: int,
+    skipped: int,
+    failed: int,
+) -> None:
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "source_dir": source_dir,
+        "status": status,
+        "total": int(total),
+        "converted": int(converted),
+        "skipped": int(skipped),
+        "failed": int(failed),
+        "updated_at": time.time(),
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+    }
+    tmp = progress_path.with_suffix(progress_path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, sort_keys=True))
+    os.replace(tmp, progress_path)
 
 
 def _save_to_boost(ctx: SceneContext, boost_path: Path) -> None:
@@ -511,7 +584,7 @@ def _save_to_boost(ctx: SceneContext, boost_path: Path) -> None:
         try:
             os.unlink(tmp_path)
         except OSError:
-            pass
+            logger.debug("Failed to remove temporary boost cache file %s", tmp_path, exc_info=True)
         raise
 
 
@@ -539,8 +612,8 @@ def _convert_one_scene(args: tuple) -> str:
         ctx = metric_cache_to_scene_context(mc, token)
         _save_to_boost(ctx, boost_path)
         return "converted"
-    except Exception as e:
-        logger.debug("Failed to convert %s: %s", source_path, e)
+    except Exception:
+        logger.warning("Failed to convert %s", source_path, exc_info=True)
         return "failed"
 
 
@@ -549,10 +622,35 @@ def warmup_boost_cache(source_dir: str, boost_dir: str, num_workers: int = 32) -
 
     Uses subprocess to avoid GIL contention with the server's main thread.
     """
-    import subprocess
-    import sys
-
     source_root = Path(source_dir)
+    boost_root = Path(boost_dir)
+    boost_root.mkdir(parents=True, exist_ok=True)
+    progress_path = _progress_path(boost_root, source_root)
+
+    if num_workers <= 0:
+        _write_progress(
+            progress_path,
+            source_dir=str(source_root),
+            status="disabled",
+            total=0,
+            converted=0,
+            skipped=0,
+            failed=0,
+        )
+        logger.info("Boost warmup disabled for %s (workers=%d)", source_dir, num_workers)
+        return get_warmup_stats()
+
+    lock_path = _lock_path(boost_root, source_root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        logger.info("Boost warmup already running for %s (lock=%s)", source_dir, lock_path)
+        return get_warmup_stats()
+
+    with os.fdopen(lock_fd, "w") as lock_file:
+        lock_file.write(f"pid={os.getpid()} host={socket.gethostname()} source={source_root}\n")
+
     # Fast estimate: count log-level subdirs (avoid slow AFS glob in main thread)
     try:
         log_dirs = [p for p in source_root.iterdir() if p.is_dir()]
@@ -562,36 +660,57 @@ def warmup_boost_cache(source_dir: str, boost_dir: str, num_workers: int = 32) -
     except OSError:
         _warmup_stats["total"] = 0
         logger.warning("Boost warmup: cannot list source_dir %s", source_dir)
+        try:
+            lock_path.unlink()
+        except OSError:
+            logger.debug("Failed to remove warmup lock %s", lock_path, exc_info=True)
         return get_warmup_stats()
 
     # Run conversion in a separate process to avoid GIL contention
     # The subprocess does its own glob + conversion
     script = f"""
-import sys, logging
+import sys, logging, json, os, time, socket
 sys.path.insert(0, '{Path(__file__).resolve().parents[3]}')
 from nous_sim_engine.adapters.navsim.cache_loader import (
     _convert_one_scene, _warmup_stats, metric_cache_to_scene_context,
 )
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('warmup')
 
-source_root = Path('{source_dir}')
-boost_dir = '{boost_dir}'
+source_root = Path({str(source_root)!r})
+boost_dir = {str(boost_root)!r}
+progress_path = Path({str(progress_path)!r})
 all_pkls = sorted(source_root.glob('**/metric_cache.pkl'))
 total = len(all_pkls)
 log.info('Warmup subprocess: %d scenes, %d workers', total, {num_workers})
 
-tasks = [(p, boost_dir) for p in all_pkls]
 converted = skipped = failed = 0
 
-from concurrent.futures import ThreadPoolExecutor
-with ThreadPoolExecutor(max_workers={num_workers}) as pool:
-    futures = {{pool.submit(_convert_one_scene, t): t for t in tasks}}
-    for i, future in enumerate(as_completed(futures), 1):
-        status = future.result()
+def write_progress(status):
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {{
+        'source_dir': str(source_root),
+        'status': status,
+        'total': total,
+        'converted': converted,
+        'skipped': skipped,
+        'failed': failed,
+        'updated_at': time.time(),
+        'host': socket.gethostname(),
+        'pid': os.getpid(),
+    }}
+    tmp = progress_path.with_suffix(progress_path.suffix + f'.tmp.{{os.getpid()}}')
+    tmp.write_text(json.dumps(payload, sort_keys=True))
+    os.replace(tmp, progress_path)
+
+write_progress('running')
+tasks = ((p, boost_dir) for p in all_pkls)
+chunksize = max(1, min(64, total // max(1, {num_workers} * 8) or 1))
+with ProcessPoolExecutor(max_workers={num_workers}) as pool:
+    for i, status in enumerate(pool.map(_convert_one_scene, tasks, chunksize=chunksize), 1):
         if status == 'converted':
             converted += 1
         elif status == 'skipped':
@@ -599,34 +718,45 @@ with ThreadPoolExecutor(max_workers={num_workers}) as pool:
         else:
             failed += 1
         if i % 2000 == 0 or i == total:
+            write_progress('running')
             log.info('Progress: %d/%d (converted=%d, skipped=%d, failed=%d)', i, total, converted, skipped, failed)
 
+write_progress('done')
 log.info('Done: converted=%d, skipped=%d, failed=%d', converted, skipped, failed)
 """
-    proc = subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
 
-    # Stream output and update stats
-    for line in proc.stdout:
-        line = line.rstrip()
-        if line:
-            logger.info("[warmup] %s", line)
-            # Parse exact total from subprocess "Warmup subprocess: N scenes" line
-            if "Warmup subprocess:" in line:
-                try:
-                    n_str = line.split("Warmup subprocess:")[1].split("scenes")[0].strip()
-                    # Correct the estimate with the actual count from glob
-                    _warmup_stats["total"] = _warmup_stats.get("total", 0) - estimated_total + int(n_str)
-                except (IndexError, ValueError):
-                    pass
+        # Stream output and update stats
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                logger.info("[warmup] %s", line)
+                # Parse exact total from subprocess "Warmup subprocess: N scenes" line
+                if "Warmup subprocess:" in line:
+                    try:
+                        n_str = line.split("Warmup subprocess:")[1].split("scenes")[0].strip()
+                        # Correct the estimate with the actual count from glob
+                        _warmup_stats["total"] = _warmup_stats.get("total", 0) - estimated_total + int(n_str)
+                    except (IndexError, ValueError):
+                        logger.debug("Failed to parse warmup total from line: %s", line, exc_info=True)
 
-    proc.wait()
-    logger.info("Boost warmup finished for %s.", source_dir)
-    return get_warmup_stats()
+        proc.wait()
+        if proc.returncode != 0:
+            logger.warning("Boost warmup subprocess exited with code %s for %s", proc.returncode, source_dir)
+        logger.info("Boost warmup finished for %s.", source_dir)
+        return get_warmup_stats()
+    finally:
+        try:
+            lock_path.unlink()
+        except OSError:
+            logger.debug("Failed to remove warmup lock %s", lock_path, exc_info=True)
 
 
 __all__ = [

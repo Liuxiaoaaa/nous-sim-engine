@@ -4,8 +4,10 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Optional, Sequence
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 
 from nous_sim_engine import __version__
@@ -80,7 +82,6 @@ def _build_rl_config(
     overrides: RLConfigOverrides | None,
 ) -> RLScorerConfig:
     """Build RLScorerConfig from scoring_mode and optional per-request overrides."""
-    from dataclasses import asdict
     base_config = RLScorerConfig.v1()
     kwargs: dict = {**asdict(base_config), "safety_mode": scoring_mode}
     if overrides is not None:
@@ -138,7 +139,6 @@ def _score_batch_controls(
     scorer_v1: PDMScorerV1 | None = None,
 ) -> BatchScoreResponse:
     """Score from direct control signals (bypass LQR controller)."""
-    import numpy as np
     batch = list(control_signals_batch)
     try:
         scene = load_scene_context(
@@ -223,14 +223,17 @@ async def _lifespan(app: FastAPI):
         if source_dir and source_dir not in source_dirs:
             source_dirs.append(source_dir)
 
-        for src in source_dirs:
-            logger.info("Starting background warmup from %s (%d workers)", src, warmup_workers)
-            thread = threading.Thread(
-                target=warmup_boost_cache,
-                args=(src, boost_dir, warmup_workers),
-                daemon=True,
-            )
-            thread.start()
+        if warmup_workers <= 0:
+            logger.info("Boost warmup disabled (SIM_ENGINE_WARMUP_WORKERS=%d)", warmup_workers)
+        else:
+            for src in source_dirs:
+                logger.info("Starting background warmup from %s (%d workers)", src, warmup_workers)
+                thread = threading.Thread(
+                    target=warmup_boost_cache,
+                    args=(src, boost_dir, warmup_workers),
+                    daemon=True,
+                )
+                thread.start()
 
     yield
 

@@ -3,6 +3,13 @@ from __future__ import annotations
 import argparse
 import os
 
+try:
+    import uvicorn
+    from nous_sim_engine.server import app
+except ImportError as _SERVER_IMPORT_ERROR:  # pragma: no cover - depends on optional extra
+    uvicorn = None
+    app = None
+
 
 def _default_workers() -> int:
     return min(4, os.cpu_count() or 1)
@@ -37,7 +44,10 @@ def _parse_args() -> argparse.Namespace:
         "--warmup-workers",
         type=int,
         default=32,
-        help="Number of parallel threads for boost cache warmup (default: 32)",
+        help=(
+            "Number of parallel processes for boost cache warmup (default: 32). "
+            "Use 0 to disable startup warmup."
+        ),
     )
     args = parser.parse_args()
 
@@ -53,19 +63,10 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    try:
-        import uvicorn
-    except ImportError as exc:  # pragma: no cover - depends on optional extra
+    if uvicorn is None or app is None:
         raise RuntimeError(
             "FastAPI server dependencies are not installed. Install nous-sim-engine[server]."
-        ) from exc
-
-    try:
-        from nous_sim_engine.server import app
-    except ImportError as exc:  # pragma: no cover - depends on optional extra
-        raise RuntimeError(
-            "FastAPI server dependencies are not installed. Install nous-sim-engine[server]."
-        ) from exc
+        ) from _SERVER_IMPORT_ERROR
 
     args = _parse_args()
 

@@ -43,10 +43,10 @@ class SceneContext:
     route_lane_ids: Set[str]
     centerline: "PDMPath"
     collided_track_ids: Set[str] = field(default_factory=set)
-    gt_trajectory: Optional[np.ndarray] = None  # (T, 2) ego-relative GT xy waypoints for open-loop analysis / diagnostics / optional debug
+    gt_trajectory: Optional[np.ndarray] = None  # (T, 2/3) ego-relative GT xy or xyh waypoints for diagnostics
     gt_progress: Optional[float] = None  # precomputed GT centerline progress (raw analysis-side-channel only)
     gt_masked_progress: Optional[float] = None  # gt_progress × gt_NC × gt_DAC (analysis-side-channel only)
-    pdm_trajectory: Optional[np.ndarray] = None  # (T, 2) ego-relative PDM reference waypoints for official v1 scoring/reference semantics
+    pdm_trajectory: Optional[np.ndarray] = None  # (T, 2/3) ego-relative PDM reference xy or xyh waypoints
     pdm_progress: Optional[float] = None  # precomputed PDM centerline progress (raw official v1 reference)
     pdm_masked_progress: Optional[float] = None  # pdm_progress × pdm_NC × pdm_DAC (official v1 reference)
     track_object_types: Dict[str, str] = field(default_factory=dict)  # token → "agent" | "static"

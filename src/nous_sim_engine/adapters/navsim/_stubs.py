@@ -9,10 +9,14 @@ Architecture:
 
 from __future__ import annotations
 
+import logging
 import math
 import pickle
 from enum import IntEnum
 from typing import Any, Dict, List, Tuple, Type
+
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -336,11 +340,8 @@ def _make_enum_stub(module: str, name: str) -> type | None:
     if key in _ENUM_STUB_CACHE:
         return _ENUM_STUB_CACHE[key]
 
-    # Create a dynamic enum that accepts any int value
-    import enum as _enum
-
     # Build a minimal enum class with a __new__ that handles unknown values
-    stub = _enum.IntEnum(name, {"_placeholder": -999})
+    stub = IntEnum(name, {"_placeholder": -999})
     stub.__module__ = module
 
     # Override __new__ to handle unknown values
@@ -432,7 +433,7 @@ class MetricCacheUnpickler(pickle.Unpickler):
         try:
             return super().find_class(module, name)
         except (ImportError, AttributeError, ModuleNotFoundError):
-            pass
+            logger.debug("Falling back to MetricCache stub for %s.%s", module, name)
 
         # 2. Explicit stub
         key = (module, name)

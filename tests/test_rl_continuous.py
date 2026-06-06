@@ -13,10 +13,14 @@ import numpy as np
 import pytest
 
 from nous_sim_engine.adapters.navsim.cache_loader import (
+    _lock_path,
     _load_pickle,
+    _write_progress,
     get_boost_cache_dir,
+    get_warmup_stats,
     load_scene_context,
     set_boost_cache_dir,
+    warmup_boost_cache,
 )
 from nous_sim_engine.core.enums import SemanticMapLayer, StateIndex
 from nous_sim_engine.core.geometry import PDMPath
@@ -126,23 +130,29 @@ class TestSceneContextReferenceSemantics:
         for state in sampled[: scene.pdm_trajectory.shape[0]]:
             dx = float(state.rear_axle.x) - ego_x
             dy = float(state.rear_axle.y) - ego_y
-            expected_pdm.append([dx * cos_h - dy * sin_h, dx * sin_h + dy * cos_h])
+            expected_pdm.append(
+                [
+                    dx * cos_h - dy * sin_h,
+                    dx * sin_h + dy * cos_h,
+                    float(state.rear_axle.heading) - ego_heading,
+                ]
+            )
         expected_pdm = np.asarray(expected_pdm, dtype=np.float64)
 
         assert scene.pdm_trajectory is not None
         assert scene.gt_trajectory is not None
         assert scene.pdm_trajectory.shape[0] > scene.gt_trajectory.shape[0]
-        assert scene.pdm_trajectory.shape[1] == 2
-        assert scene.gt_trajectory.shape[1] == 2
+        assert scene.pdm_trajectory.shape[1] == 3
+        assert scene.gt_trajectory.shape[1] >= 2
         assert not np.shares_memory(scene.pdm_trajectory, scene.gt_trajectory)
         np.testing.assert_allclose(scene.pdm_trajectory, expected_pdm, atol=1e-6)
         assert not np.allclose(
-            scene.pdm_trajectory[: scene.gt_trajectory.shape[0]],
-            scene.gt_trajectory,
+            scene.pdm_trajectory[: scene.gt_trajectory.shape[0], :2],
+            scene.gt_trajectory[:, :2],
             atol=1e-6,
         )
         np.testing.assert_allclose(
-            scene.gt_trajectory[:2],
+            scene.gt_trajectory[:2, :2],
             np.asarray(metric_cache.human_trajectory.poses[:2, :2], dtype=np.float64),
             atol=1e-6,
         )
@@ -177,6 +187,71 @@ class TestSceneContextReferenceSemantics:
         assert scene_a.gt_progress == 11.0
         assert scene_b.gt_progress == 22.0
         assert scene_a.gt_progress != scene_b.gt_progress
+
+    def test_warmup_stats_reads_progress_files_without_scanning_pickles(self, tmp_path: Path):
+        boost_dir = tmp_path / "boost"
+        previous_boost_cache_dir = get_boost_cache_dir()
+        try:
+            set_boost_cache_dir(str(boost_dir))
+            _write_progress(
+                boost_dir / ".warmup" / "progress" / "a.json",
+                source_dir="/cache/a",
+                status="running",
+                total=10,
+                converted=3,
+                skipped=2,
+                failed=1,
+            )
+            _write_progress(
+                boost_dir / ".warmup" / "progress" / "b.json",
+                source_dir="/cache/b",
+                status="done",
+                total=5,
+                converted=4,
+                skipped=1,
+                failed=0,
+            )
+
+            stats = get_warmup_stats()
+        finally:
+            set_boost_cache_dir(previous_boost_cache_dir)
+
+        assert stats["total"] == 15
+        assert stats["converted"] == 7
+        assert stats["skipped"] == 3
+        assert stats["failed"] == 1
+
+    def test_warmup_can_be_disabled(self, tmp_path: Path):
+        source_dir = tmp_path / "metric_cache"
+        boost_dir = tmp_path / "boost"
+        source_dir.mkdir()
+        previous_boost_cache_dir = get_boost_cache_dir()
+        try:
+            set_boost_cache_dir(str(boost_dir))
+            stats = warmup_boost_cache(str(source_dir), str(boost_dir), num_workers=0)
+        finally:
+            set_boost_cache_dir(previous_boost_cache_dir)
+
+        assert stats["total"] == 0
+        assert stats["converted"] == 0
+
+    def test_warmup_lock_prevents_duplicate_conversion(self, tmp_path: Path):
+        source_dir = tmp_path / "metric_cache"
+        boost_dir = tmp_path / "boost"
+        source_dir.mkdir()
+        lock_path = _lock_path(boost_dir, source_dir)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("already running")
+
+        previous_boost_cache_dir = get_boost_cache_dir()
+        try:
+            set_boost_cache_dir(str(boost_dir))
+            stats = warmup_boost_cache(str(source_dir), str(boost_dir), num_workers=4)
+        finally:
+            set_boost_cache_dir(previous_boost_cache_dir)
+
+        assert lock_path.exists()
+        assert stats["total"] == 0
 
 
 

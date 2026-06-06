@@ -6,6 +6,7 @@ from typing import Iterable, List, Sequence
 import numpy as np
 import numpy.typing as npt
 import shapely
+from scipy.interpolate import CubicSpline
 from shapely.geometry import LineString, Point
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union, nearest_points
@@ -194,8 +195,6 @@ class ScorerBase:
         Cubic spline fit + first derivative gives the tangent heading, which is
         consistent with NavSim/RecogDrive where the agent directly outputs heading.
         """
-        from scipy.interpolate import CubicSpline
-
         batch_size, num_points, _ = waypoints_xy.shape
         t = np.arange(num_points, dtype=np.float64)
         headings = np.zeros((batch_size, num_points), dtype=np.float64)
@@ -722,8 +721,8 @@ class ScorerBase:
         if trajectory.ndim != 2 or trajectory.shape[-1] not in (2, 3) or trajectory.shape[0] == 0:
             return None
 
+        reference_waypoints = trajectory[None, ...]
         try:
-            reference_waypoints = trajectory[None, ...]
             if reference_waypoints.shape[1] == self.REQUIRED_NUM_WAYPOINTS:
                 proposals = self._build_proposals(reference_waypoints, scene)
             else:
@@ -768,9 +767,12 @@ class ScorerBase:
                     simulated, scene,
                 )[0]
 
-            return _GTSimResult(progress=progress, multi_metrics=multi, weighted_metrics=weighted)
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to simulate reference trajectory for scene {scene.log_name}/{scene.scene_token}"
+            ) from exc
+
+        return _GTSimResult(progress=progress, multi_metrics=multi, weighted_metrics=weighted)
 
     def _simulate_and_score_gt(
         self,

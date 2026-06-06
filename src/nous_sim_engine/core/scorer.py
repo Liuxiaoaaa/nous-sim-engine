@@ -10,6 +10,7 @@ from typing import List
 import numpy as np
 
 from .scoring.base import PDMScorerConfig, RLScorerConfig, _GTSimResult
+from .scoring.base import ScorerBase
 from .scoring.scorer_v1 import PDMScorerV1
 from .scoring.scorer_v2 import PDMScorerV2
 from .scoring.scorer_rl import RLScorer as _RLScorerImpl
@@ -58,7 +59,6 @@ class PDMScorer:
 
     def _simulate_and_score_gt(self, scene: SceneContext) -> _GTSimResult | None:
         """Backward-compatible GT simulation."""
-        from .scoring.base import ScorerBase
         base = ScorerBase()
         return base._simulate_and_score_gt(scene)
 

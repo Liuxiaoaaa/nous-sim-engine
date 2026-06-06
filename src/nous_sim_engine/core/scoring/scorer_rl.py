@@ -69,16 +69,18 @@ class RLScorer(ScorerBase):
         """PDM per-step centerline arc-lengths, shape (1, T)."""
         if scene.pdm_trajectory is None:
             return None
+        reference_waypoints = scene.pdm_trajectory[None, ...]
         try:
-            reference_waypoints = scene.pdm_trajectory[None, ...]
             proposals = self._build_proposals(reference_waypoints, scene)
             simulated = self._simulator.simulate_proposals(
                 ego_state=scene.ego_state, proposals=proposals, observation=scene.observation,
             )
             coords = state_to_coords(simulated, self._vehicle)
             return calculate_progress(coords, scene.centerline)  # (1, T)
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to compute PDM per-step progress for scene {scene.log_name}/{scene.scene_token}"
+            ) from exc
 
     def _progress_per_waypoint(
         self, ego_coords: np.ndarray, scene: SceneContext, rl_config: RLScorerConfig,

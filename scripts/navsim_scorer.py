@@ -20,11 +20,42 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+try:
+    from scipy.interpolate import interp1d
+except ImportError:  # pragma: no cover - depends on validation environment
+    interp1d = None
+
+try:
+    from navsim.common.dataclasses import Trajectory
+    from navsim.evaluate.pdm_score import pdm_score
+    from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import (
+        PDMScorer as NavSimPDMScorer,
+        PDMScorerConfig as NavSimPDMScorerConfig,
+    )
+    from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import (
+        PDMSimulator,
+    )
+    from navsim.traffic_agents_policies.log_replay_traffic_agents import (
+        LogReplayTrafficAgents,
+    )
+    from nuplan.planning.simulation.trajectory.trajectory_sampling import (
+        TrajectorySampling,
+    )
+except ImportError:  # pragma: no cover - depends on NavSim environment
+    Trajectory = None
+    pdm_score = None
+    PDMSimulator = None
+    NavSimPDMScorer = None
+    NavSimPDMScorerConfig = None
+    LogReplayTrafficAgents = None
+    TrajectorySampling = None
 
 # ── nous-sim-engine imports ──────────────────────────────────────────────
 from nous_sim_engine.adapters.navsim.cache_loader import (
@@ -117,24 +148,15 @@ def _compare_results(ours: dict, ref: dict) -> None:
 
 def _run_navsim_reference(metric_cache, waypoints: np.ndarray) -> dict | None:
     """Try to compute NavSim reference PDM score. Returns None if unavailable."""
-    try:
-        import math
-        from navsim.common.dataclasses import Trajectory
-        from navsim.evaluate.pdm_score import pdm_score
-        from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import (
-            PDMSimulator,
-        )
-        from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import (
-            PDMScorer as NavSimPDMScorer,
-            PDMScorerConfig as NavSimPDMScorerConfig,
-        )
-        from navsim.traffic_agents_policies.log_replay_traffic_agents import (
-            LogReplayTrafficAgents,
-        )
-        from nuplan.planning.simulation.trajectory.trajectory_sampling import (
-            TrajectorySampling,
-        )
-    except ImportError:
+    if (
+        Trajectory is None
+        or pdm_score is None
+        or PDMSimulator is None
+        or NavSimPDMScorer is None
+        or NavSimPDMScorerConfig is None
+        or LogReplayTrafficAgents is None
+        or TrajectorySampling is None
+    ):
         return None
 
     # Build NavSim Trajectory from waypoints
@@ -143,8 +165,8 @@ def _run_navsim_reference(metric_cache, waypoints: np.ndarray) -> dict | None:
 
     # Subsample/interpolate to 10Hz if needed
     if len(waypoints) <= 10:
-        from scipy.interpolate import interp1d
-
+        if interp1d is None:
+            return None
         t_orig = np.linspace(0, 5.0, len(waypoints))
         t_target = np.linspace(0.1, 5.0, 50)
         ix = interp1d(t_orig, waypoints[:, 0], kind="linear", fill_value="extrapolate")
