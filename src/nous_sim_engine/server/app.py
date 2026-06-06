@@ -361,12 +361,18 @@ def create_app() -> FastAPI:
             stats = get_warmup_stats()
             total = stats.get("total", 0)
             converted = stats.get("converted", 0)
+            skipped = stats.get("skipped", 0)
+            failed = stats.get("failed", 0)
+            completed = converted + skipped + failed
             boost_info = {
                 "enabled": True,
                 "dir": boost_dir,
                 "converted": converted,
+                "skipped": skipped,
+                "failed": failed,
+                "completed": completed,
                 "total": total,
-                "progress_pct": round(converted / total * 100, 1) if total > 0 else 0.0,
+                "progress_pct": round(completed / total * 100, 1) if total > 0 else 0.0,
             }
         return HealthResponse(
             status="ok",

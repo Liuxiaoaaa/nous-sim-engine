@@ -94,6 +94,24 @@ class TestHealth:
         result = sim_client.health()
         assert result["status"] == "ok"
 
+    def test_health_progress_counts_skipped_and_failed(self, app_and_client):
+        with (
+            patch("nous_sim_engine.server.app.get_boost_cache_dir", return_value="/tmp/boost_cache"),
+            patch(
+                "nous_sim_engine.server.app.get_warmup_stats",
+                return_value={"converted": 60, "skipped": 30, "failed": 10, "total": 100},
+            ),
+        ):
+            resp = app_and_client.get("/v1/health")
+
+        assert resp.status_code == 200
+        boost = resp.json()["boost_cache"]
+        assert boost["converted"] == 60
+        assert boost["skipped"] == 30
+        assert boost["failed"] == 10
+        assert boost["completed"] == 100
+        assert boost["progress_pct"] == 100.0
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 2. PDM Scoring endpoints (/v1/score, /v1/score/batch)
