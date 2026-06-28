@@ -27,10 +27,6 @@ class PDMSimulator:
         self._discretization_time = float(discretization_time)
         self._vehicle = vehicle or VehicleParams()
         self._motion_model = BatchKinematicBicycleModel(vehicle=self._vehicle)
-        self._tracker = BatchLQRTracker(
-            discretization_time=self._discretization_time,
-            vehicle=self._vehicle,
-        )
 
     @staticmethod
     def _extract_pose(state: np.ndarray) -> np.ndarray:
@@ -70,17 +66,17 @@ class PDMSimulator:
             raise ValueError("proposals must contain at least one pose")
 
         dt = self._resolve_dt(observation)
-        self._tracker.discretization_time = dt
 
         # Proposals already include t=0 ego pose — use directly as reference.
         batch_size, num_steps, _ = proposals.shape
 
         simulated_states = np.zeros((batch_size, num_steps, StateIndex.size()), dtype=np.float64)
         simulated_states[:, 0, :] = ego_state[None, :]
-        self._tracker.update(proposals)
+        tracker = BatchLQRTracker(discretization_time=dt, vehicle=self._vehicle)
+        tracker.update(proposals)
 
         for time_idx in range(num_steps - 1):
-            accelerations, steering_rates = self._tracker.track_trajectory(
+            accelerations, steering_rates = tracker.track_trajectory(
                 current_state=simulated_states[:, time_idx, :],
                 time_idx=time_idx,
             )

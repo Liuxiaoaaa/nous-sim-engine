@@ -35,6 +35,7 @@ class PDMScorerV2(ScorerBase):
         scene: SceneContext,
         *,
         include_ego: bool = False,
+        independent_progress_fallback: bool = False,
     ) -> List[ScoringResult]:
         batch_waypoints = self._coerce_trajectories(trajectories_xy)
         proposals = self._build_proposals(batch_waypoints, scene, include_ego=include_ego)
@@ -67,7 +68,10 @@ class PDMScorerV2(ScorerBase):
         gt_progress = gt_result.progress if gt_result else None
 
         weighted_metrics[:, WeightedMetricIndex.PROGRESS] = self._normalize_progress_v2(
-            progress_raw, multi_metrics, gt_progress=gt_progress,
+            progress_raw,
+            multi_metrics,
+            gt_progress=gt_progress,
+            independent_fallback=independent_progress_fallback,
         )
         weighted_metrics[:, WeightedMetricIndex.TTC] = self._time_to_collision(
             simulated_states, ego_coords, ego_areas, scene,
@@ -113,6 +117,8 @@ class PDMScorerV2(ScorerBase):
         progress_raw: np.ndarray,
         multi_metrics: np.ndarray,
         gt_progress: float | None = None,
+        *,
+        independent_fallback: bool = False,
     ) -> np.ndarray:
         """V2 progress: GT normalization, zero out when multi=0."""
         multi_prod = multi_metrics.prod(axis=1)
@@ -121,6 +127,11 @@ class PDMScorerV2(ScorerBase):
             normalized = np.clip(progress_raw / gt_progress, 0.0, 1.0)
             normalized[multi_prod == 0.0] = 0.0
             return normalized
+
+        if independent_fallback:
+            result = np.ones_like(progress_raw, dtype=np.float64)
+            result[multi_prod == 0.0] = 0.0
+            return result
 
         max_progress = float(progress_raw.max()) if len(progress_raw) > 0 else 0.0
         if max_progress > self._config.progress_distance_threshold:

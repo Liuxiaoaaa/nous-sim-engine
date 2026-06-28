@@ -202,10 +202,27 @@ class ScorerBase:
         for b in range(batch_size):
             x, y = waypoints_xy[b, :, 0], waypoints_xy[b, :, 1]
 
-            # Degenerate case: all points nearly identical (stationary)
-            total_dist = np.sum(np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2))
+            deltas = np.diff(waypoints_xy[b, :, :2], axis=0)
+            segment_lengths = np.linalg.norm(deltas, axis=1)
+            total_dist = np.sum(segment_lengths)
             if total_dist < 1e-6:
                 headings[b] = 0.0
+                continue
+
+            # Repeated/stationary waypoints make cubic-spline tangents oscillate
+            # wildly. Propagate the nearest valid motion heading through those
+            # stationary spans instead of inventing a turn.
+            moving = segment_lengths > 1e-3
+            if not np.all(moving):
+                segment_headings = np.zeros(num_points - 1, dtype=np.float64)
+                segment_headings[moving] = np.arctan2(deltas[moving, 1], deltas[moving, 0])
+                first_heading = float(segment_headings[np.flatnonzero(moving)[0]])
+                current_heading = first_heading
+                headings[b, 0] = current_heading
+                for point_idx in range(1, num_points):
+                    if moving[point_idx - 1]:
+                        current_heading = float(segment_headings[point_idx - 1])
+                    headings[b, point_idx] = current_heading
                 continue
 
             cs_x = CubicSpline(t, x)

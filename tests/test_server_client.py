@@ -222,6 +222,43 @@ class TestPDMScoring:
         # Safe trajectory should score higher than offroad
         assert data["results"][0]["pdm_score"] >= data["results"][1]["pdm_score"]
 
+    def test_score_batch_matches_independent_single_scores(self, straight_road_scene):
+        scene = copy.deepcopy(straight_road_scene)
+        scene.pdm_masked_progress = 0.0
+        short_trajectory = [[1.0 * t, 0.0] for t in range(1, 9)]
+        long_trajectory = [[2.5 * t, 0.0] for t in range(1, 9)]
+
+        with patch("nous_sim_engine.server.app.load_scene_context", return_value=scene):
+            with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+                app = create_app()
+                with TestClient(app) as tc:
+                    batch_resp = tc.post("/v1/score/batch", json={
+                        "trajectories": [short_trajectory, long_trajectory],
+                        "scene_token": SCENE_TOKEN,
+                        "log_name": LOG_NAME,
+                        "dataset": DATASET,
+                    })
+                    single_resps = [
+                        tc.post("/v1/score", json={
+                            "trajectory": trajectory,
+                            "scene_token": SCENE_TOKEN,
+                            "log_name": LOG_NAME,
+                            "dataset": DATASET,
+                        })
+                        for trajectory in [short_trajectory, long_trajectory]
+                    ]
+
+        assert batch_resp.status_code == 200
+        for resp in single_resps:
+            assert resp.status_code == 200
+
+        batch_results = batch_resp.json()["results"]
+        single_results = [resp.json() for resp in single_resps]
+        assert len(batch_results) == len(single_results)
+        for batch_result, single_result in zip(batch_results, single_results):
+            assert batch_result["pdm_score"] == pytest.approx(single_result["pdm_score"])
+            assert batch_result["ego_progress"] == pytest.approx(single_result["ego_progress"])
+
     def test_client_score_batch(self, sim_client, safe_trajectory, offroad_trajectory):
         results = sim_client.score_batch(
             trajectories=[safe_trajectory, offroad_trajectory],

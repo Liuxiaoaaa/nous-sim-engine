@@ -71,11 +71,8 @@ class PDMObservation:
 
         self._num_steps = num_steps
         self._interval_time = interval_time
-        self._observation_sample_res = self._infer_observation_sample_res(interval_time)
-        self._global_to_local_idcs = [
-            min(step_idx // self._observation_sample_res, (num_steps - 1) // self._observation_sample_res)
-            for step_idx in range(num_steps)
-        ]
+        self._observation_sample_res = 1
+        self._global_to_local_idcs = list(range(num_steps))
         self._occupancy_maps: List[Optional[OccupancyMap]] = [None] * num_steps
         self._red_light_maps: List[Optional[OccupancyMap]] = [None] * num_steps
 

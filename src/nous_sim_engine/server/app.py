@@ -11,7 +11,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 
 from nous_sim_engine import __version__
-from nous_sim_engine.adapters.navsim.cache_loader import (
+from nous_sim_engine.adapters.dataset_loader import (
     get_boost_cache_dir,
     get_warmup_stats,
     load_scene_context,
@@ -121,10 +121,15 @@ def _score_batch(
         )
         if scoring_version == "v2":
             scorer = scorer_v2 or PDMScorerV2()
-            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene, include_ego=include_ego)
         else:
             scorer = scorer_v1 or PDMScorerV1()
-            results = scorer.score_batch(trajectories_xy=batch_trajectories, scene=scene, include_ego=include_ego)
+
+        results = scorer.score_batch(
+            trajectories_xy=batch_trajectories,
+            scene=scene,
+            include_ego=include_ego,
+            independent_progress_fallback=True,
+        )
         return BatchScoreResponse(results=[_result_to_response(r) for r in results])
     except Exception as exc:
         return _error_results(str(exc), batch_size=len(batch_trajectories))
@@ -172,7 +177,11 @@ def _score_batch_rl(
         )
         scorer = scorer_rl or RLScorer()
         results = scorer.score_batch(
-            trajectories_xy=batch_trajectories, scene=scene, rl_config=rl_config, include_ego=include_ego,
+            trajectories_xy=batch_trajectories,
+            scene=scene,
+            rl_config=rl_config,
+            include_ego=include_ego,
+            independent_progress_fallback=True,
         )
         return BatchRLScoreResponse(results=[_rl_result_to_response(r) for r in results])
     except Exception as exc:

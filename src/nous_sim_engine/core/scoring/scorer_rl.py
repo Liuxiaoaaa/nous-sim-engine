@@ -30,6 +30,8 @@ class RLScorer(ScorerBase):
         nc: np.ndarray,
         dac: np.ndarray,
         pdm_masked_progress: float | None,
+        *,
+        independent_fallback: bool = False,
     ) -> np.ndarray:
         """V1-aligned progress normalization for discrete RL mode.
 
@@ -48,6 +50,11 @@ class RLScorer(ScorerBase):
                 out=np.zeros_like(masked_progress, dtype=np.float64),
                 where=denominator > 0.0,
             )
+
+        if independent_fallback:
+            normalized = np.ones_like(progress_raw, dtype=np.float64)
+            normalized[multi_prod == 0.0] = 0.0
+            return normalized
 
         max_masked = float(masked_progress.max()) if len(masked_progress) > 0 else 0.0
         if max_masked > self._PROGRESS_DISTANCE_THRESHOLD:
@@ -152,6 +159,7 @@ class RLScorer(ScorerBase):
         rl_config: RLScorerConfig | None = None,
         *,
         include_ego: bool = False,
+        independent_progress_fallback: bool = False,
     ) -> List[RLScoringResult]:
         rl_config = rl_config or RLScorerConfig.v1()
 
@@ -221,7 +229,13 @@ class RLScorer(ScorerBase):
         if rl_config.safety_mode == "discrete":
             # V1-aligned: v1 progress normalization, binary TTC (1s), binary HC
             progress_raw = self._progress(ego_coords, scene)
-            ep = self._normalize_progress_v1_inline(progress_raw, nc, dac, pdm_masked)
+            ep = self._normalize_progress_v1_inline(
+                progress_raw,
+                nc,
+                dac,
+                pdm_masked,
+                independent_fallback=independent_progress_fallback,
+            )
             ttc = self._time_to_collision(simulated_states, ego_coords, ego_areas, scene)
             hc = self._history_comfort(simulated_states, scene, use_past_states=False)
         else:
@@ -266,6 +280,7 @@ class RLScorer(ScorerBase):
                 pdms_nc,
                 pdms_dac,
                 pdm_masked,
+                independent_fallback=independent_progress_fallback,
             )
             pdms_ttc = self._time_to_collision(simulated_states, ego_coords, ego_areas, scene)
             pdms_hc = self._history_comfort(simulated_states, scene, use_past_states=False)

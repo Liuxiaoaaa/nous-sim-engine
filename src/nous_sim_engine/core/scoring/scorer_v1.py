@@ -42,13 +42,19 @@ class PDMScorerV1(ScorerBase):
         scene: SceneContext,
         *,
         include_ego: bool = False,
+        independent_progress_fallback: bool = False,
     ) -> List[ScoringResult]:
         batch_waypoints = self._coerce_trajectories(trajectories_xy)
         proposals = self._build_proposals(batch_waypoints, scene, include_ego=include_ego)
         simulated_states = self._simulator.simulate_proposals(
             ego_state=scene.ego_state, proposals=proposals, observation=scene.observation,
         )
-        return self._score_from_simulated(simulated_states, scene, len(batch_waypoints))
+        return self._score_from_simulated(
+            simulated_states,
+            scene,
+            len(batch_waypoints),
+            independent_progress_fallback=independent_progress_fallback,
+        )
 
     def score_batch_from_controls(
         self,
@@ -74,6 +80,8 @@ class PDMScorerV1(ScorerBase):
         simulated_states: np.ndarray,
         scene: SceneContext,
         batch_size: int,
+        *,
+        independent_progress_fallback: bool = False,
     ) -> List[ScoringResult]:
         ego_coords = state_to_coords(simulated_states, self._vehicle)
         ego_polygons = coords_to_polygons(ego_coords)
@@ -101,7 +109,10 @@ class PDMScorerV1(ScorerBase):
         pdm_masked_progress = self._resolve_pdm_masked_progress(scene)
 
         weighted_metrics[:, WeightedMetricIndex.PROGRESS] = self._normalize_progress_v1(
-            progress_raw, multi_metrics, pdm_masked_progress=pdm_masked_progress,
+            progress_raw,
+            multi_metrics,
+            pdm_masked_progress=pdm_masked_progress,
+            independent_fallback=independent_progress_fallback,
         )
         weighted_metrics[:, WeightedMetricIndex.TTC] = self._time_to_collision(
             simulated_states, ego_coords, ego_areas, scene,
@@ -166,6 +177,7 @@ class PDMScorerV1(ScorerBase):
         multi_metrics: np.ndarray,
         *,
         pdm_masked_progress: float | None = None,
+        independent_fallback: bool = False,
     ) -> np.ndarray:
         """V1 progress normalization aligned with official PDM reference context.
 
@@ -189,6 +201,9 @@ class PDMScorerV1(ScorerBase):
                 out=np.zeros_like(masked_progress, dtype=np.float64),
                 where=denominator > 0.0,
             )
+        elif independent_fallback:
+            normalized = np.ones_like(progress_raw, dtype=np.float64)
+            normalized[multi_prod == 0.0] = 0.0
         else:
             max_masked = float(masked_progress.max()) if len(masked_progress) > 0 else 0.0
             if max_masked > self._progress_distance_threshold:
