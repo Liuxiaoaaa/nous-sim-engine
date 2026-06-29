@@ -8,13 +8,16 @@ from shapely.geometry import Point, Polygon
 
 from ..enums import BBCoordsIndex
 from ..geometry import coords_to_polygons, state_to_coords
-from ..types import InternalScoringResult, KeyActionObstacle, SceneContext
+from ..types import InternalScoringResult, KeyActionObstacle, SceneContext, VehicleParams
 from .base import ScorerBase
 
 
 @dataclass(frozen=True)
 class InternalKeyActionScorerConfig:
-    follow_margin: float = 2.0
+    follow_margin: float = 0.1
+    nudge_trigger_margin: float = 0.1
+    min_no_nudge_upper_bound: float = 0.1
+    no_nudge_gate_min_front_gap: float = 0.1
     pass_margin: float = 1.0
     s_min: float = 3.0
     d_back: float = 2.0
@@ -33,8 +36,22 @@ class _ProjectedObstacle:
     polygon: Polygon
 
 
+def _internal_vehicle_params() -> VehicleParams:
+    return VehicleParams(
+        half_length=4.765 / 2.0,
+        half_width=1.884 / 2.0,
+        rear_axle_to_center=1.3555,
+        wheel_base=1.392 + 1.438,
+    )
+
+
 class InternalKeyActionScorer(ScorerBase):
     """Hard internal closed-loop scorer based on labeled key-action obstacles."""
+
+    def __init__(self, **kwargs) -> None:
+        if kwargs.get("vehicle") is None:
+            kwargs["vehicle"] = _internal_vehicle_params()
+        super().__init__(**kwargs)
 
     def score(
         self,
@@ -75,23 +92,16 @@ class InternalKeyActionScorer(ScorerBase):
                 for _ in range(len(batch_waypoints))
             ]
 
-        first_no_nudge = self._first_no_nudge(projected_obstacles)
+        ego_front_now = self._ego_current_front_progress(scene)
+        first_no_nudge = self._first_no_nudge(projected_obstacles, ego_front_now, config)
         upper_bound = (
-            first_no_nudge.s_back - config.follow_margin
+            max(
+                first_no_nudge.s_back - config.follow_margin,
+                config.min_no_nudge_upper_bound,
+            )
             if first_no_nudge is not None
             else None
         )
-        if upper_bound is not None and upper_bound <= 0.0:
-            return [
-                InternalScoringResult(
-                    sample_valid=False,
-                    invalid_reason="first_no_nudge_upper_bound_not_positive",
-                    first_no_nudge_upper_bound=float(upper_bound),
-                    num_relevant_labeled=len(projected_obstacles),
-                    error="first_no_nudge_upper_bound_not_positive",
-                )
-                for _ in range(len(batch_waypoints))
-            ]
 
         key_actions = self._key_actions(projected_obstacles, upper_bound)
         if first_no_nudge is None and not key_actions:
@@ -136,7 +146,7 @@ class InternalKeyActionScorer(ScorerBase):
                 passed_count = 0
             else:
                 passed_count = sum(
-                    ego_rear_max[idx] > obstacle.s_front + config.pass_margin
+                    ego_front_max[idx] > obstacle.s_back + config.nudge_trigger_margin
                     for obstacle in key_actions
                 )
                 if key_actions:
@@ -234,11 +244,14 @@ class InternalKeyActionScorer(ScorerBase):
     @staticmethod
     def _first_no_nudge(
         projected_obstacles: list[_ProjectedObstacle],
+        ego_front_now: float,
+        config: InternalKeyActionScorerConfig,
     ) -> _ProjectedObstacle | None:
+        min_gate_s_back = ego_front_now + config.no_nudge_gate_min_front_gap
         no_nudges = [
             obstacle
             for obstacle in projected_obstacles
-            if obstacle.annotation.label == 0 and obstacle.s_back > 0.0
+            if obstacle.annotation.label == 0 and obstacle.s_back > min_gate_s_back
         ]
         return min(no_nudges, key=lambda item: item.s_back) if no_nudges else None
 
@@ -254,7 +267,7 @@ class InternalKeyActionScorer(ScorerBase):
             ]
         return [
             obstacle for obstacle in projected_obstacles
-            if obstacle.annotation.label == 1 and obstacle.s_front < upper_bound
+            if obstacle.annotation.label == 1 and obstacle.s_back < upper_bound
         ]
 
     @staticmethod
@@ -281,6 +294,15 @@ class InternalKeyActionScorer(ScorerBase):
             front_max[batch_idx] = max(front_values) if front_values else 0.0
             rear_max[batch_idx] = max(rear_values) if rear_values else 0.0
         return front_max, rear_max
+
+    def _ego_current_front_progress(self, scene: SceneContext) -> float:
+        s0 = scene.centerline.project(Point(0.0, 0.0))
+        ego_coords = state_to_coords(scene.ego_state[None, :], self._vehicle)
+        front_indices = [BBCoordsIndex.FRONT_LEFT, BBCoordsIndex.FRONT_RIGHT]
+        return max(
+            scene.centerline.project(Point(*ego_coords[0, corner_idx])) - s0
+            for corner_idx in front_indices
+        )
 
     @staticmethod
     def _progress_norm(

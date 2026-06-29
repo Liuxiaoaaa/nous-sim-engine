@@ -131,6 +131,9 @@ class BatchRLScoreRequest(BaseModel):
 
 class InternalConfigOverrides(BaseModel):
     follow_margin: Optional[float] = None
+    nudge_trigger_margin: Optional[float] = None
+    min_no_nudge_upper_bound: Optional[float] = None
+    no_nudge_gate_min_front_gap: Optional[float] = None
     pass_margin: Optional[float] = None
     s_min: Optional[float] = None
     d_back: Optional[float] = None
