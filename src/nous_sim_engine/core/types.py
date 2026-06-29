@@ -22,6 +22,17 @@ class VehicleParams:
 
 
 @dataclass
+class KeyActionObstacle:
+    """Internal key-action obstacle annotation in sim-engine coordinates."""
+
+    token: str
+    label: int
+    polygon_coords: np.ndarray
+    object_type: str = "agent"
+    speed_mps: float = 0.0
+
+
+@dataclass
 class SceneContext:
     """Scene data for scoring.
 
@@ -51,6 +62,9 @@ class SceneContext:
     pdm_masked_progress: Optional[float] = None  # pdm_progress × pdm_NC × pdm_DAC (official v1 reference)
     track_object_types: Dict[str, str] = field(default_factory=dict)  # token → "agent" | "static"
     track_speeds: Dict[str, float] = field(default_factory=dict)  # token → GT speed (m/s) from annotation
+    key_action_obstacles: List[KeyActionObstacle] = field(default_factory=list)
+    candidate_trajectory: Optional[np.ndarray] = None  # internal candidate trajectory for progress scale
+    candidate_progress: Optional[float] = None
 
 
 @dataclass
@@ -156,3 +170,32 @@ class RLScoringResult:
             "lk": self.lane_keeping,
             "hc": self.history_comfort,
         }
+
+
+@dataclass
+class InternalScoringResult:
+    """Hard internal key-action score for internal L4 scenes."""
+
+    internal_score: float = 0.0
+    safety_score: float = 0.0
+    comfort_score: float = 0.0
+    key_action_score: float = 0.0
+    progress_score: float = 0.0
+    no_at_fault_collisions: float = 1.0
+    drivable_area_compliance: float = 1.0
+    sample_valid: bool = True
+    invalid_reason: Optional[str] = None
+    first_no_nudge_upper_bound: Optional[float] = None
+    overrun_no_nudge_gate: bool = False
+    num_relevant_labeled: int = 0
+    num_key_actions: int = 0
+    num_key_actions_passed: int = 0
+    ego_front_max: float = 0.0
+    ego_rear_max: float = 0.0
+    raw_progress: float = 0.0
+    progress_norm: float = 0.0
+    progress_norm_source: str = "none"
+    error: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)

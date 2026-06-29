@@ -222,6 +222,96 @@ class SimEngineClient:
 
         return [self._normalize_output(self._normalize_rl_result(item, endpoint="/v1/score/rl/batch")) for item in results]
 
+    # ── Internal Key-Action Scoring ────────────────────────────────────────
+
+    def score_internal_rl(
+        self,
+        trajectory: List[List[float]],
+        scene_token: str,
+        log_name: str,
+        dataset: str,
+        config_overrides: Optional[Dict[str, float]] = None,
+        trajectory_frame: Literal["nous", "nuplan"] = "nous",
+    ) -> Tuple[float, dict[str, Any]]:
+        """Score one trajectory with the internal hard key-action metric."""
+        payload: dict[str, Any] = {
+            "trajectory": self._normalize_trajectory_input(trajectory, trajectory_frame),
+            "scene_token": scene_token,
+            "log_name": log_name,
+            "dataset": dataset,
+        }
+        if config_overrides:
+            payload["config_overrides"] = config_overrides
+
+        try:
+            response = self._request_json(
+                method="POST",
+                path="/v1/score/internal/rl",
+                payload=payload,
+            )
+        except SimEngineClientError as exc:
+            error_result = self._internal_error_result(str(exc))
+            return 0.0, error_result
+
+        result = self._normalize_internal_result(response, endpoint="/v1/score/internal/rl")
+        score = self._internal_result_score(result)
+        if result.get("error"):
+            return 0.0, result
+        return score, result
+
+    def score_batch_internal_rl(
+        self,
+        trajectories: List[List[List[float]]],
+        scene_token: str,
+        log_name: str,
+        dataset: str,
+        config_overrides: Optional[Dict[str, float]] = None,
+        trajectory_frame: Literal["nous", "nuplan"] = "nous",
+    ) -> List[dict[str, Any]]:
+        """Score a batch of trajectories with the internal hard key-action metric."""
+        payload: dict[str, Any] = {
+            "trajectories": [
+                self._normalize_trajectory_input(t, trajectory_frame)
+                for t in trajectories
+            ],
+            "scene_token": scene_token,
+            "log_name": log_name,
+            "dataset": dataset,
+        }
+        if config_overrides:
+            payload["config_overrides"] = config_overrides
+
+        try:
+            response = self._request_json(
+                method="POST",
+                path="/v1/score/internal/rl/batch",
+                payload=payload,
+            )
+        except SimEngineClientError as exc:
+            return [self._internal_error_result(str(exc)) for _ in trajectories]
+
+        if not isinstance(response, dict):
+            return [
+                self._internal_error_result(
+                    "Invalid JSON payload from /v1/score/internal/rl/batch: expected object"
+                )
+                for _ in trajectories
+            ]
+
+        results = response.get("results")
+        if not isinstance(results, list) or len(results) != len(trajectories):
+            return [
+                self._internal_error_result(
+                    "Invalid JSON payload from /v1/score/internal/rl/batch: malformed results"
+                )
+                for _ in trajectories
+            ]
+
+        return [
+            self._normalize_internal_result(item, endpoint="/v1/score/internal/rl/batch")
+            for item in results
+        ]
+
     # ── Dataset Management ──────────────────────────────────────────────
 
     def list_datasets(self) -> Dict[str, str]:
@@ -346,6 +436,14 @@ class SimEngineClient:
         result.update(response)
         return result
 
+    def _normalize_internal_result(self, response: Any, endpoint: str) -> dict[str, Any]:
+        if not isinstance(response, dict):
+            return self._internal_error_result(f"Invalid JSON payload from {endpoint}: expected object")
+
+        result = self._internal_error_result("")
+        result.update(response)
+        return result
+
     def _result_score(self, result: dict[str, Any]) -> float:
         try:
             return float(result.get("pdm_score", 0.0) or 0.0)
@@ -355,6 +453,12 @@ class SimEngineClient:
     def _rl_result_score(self, result: dict[str, Any]) -> float:
         try:
             return float(result.get("rl_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _internal_result_score(self, result: dict[str, Any]) -> float:
+        try:
+            return float(result.get("internal_score", 0.0) or 0.0)
         except (TypeError, ValueError):
             return 0.0
 
@@ -393,6 +497,30 @@ class SimEngineClient:
             "pdms_lane_keeping": 1.0,
             "pdms_history_comfort": 1.0,
             "sub_rewards": {},
+            "error": message or None,
+        }
+
+    def _internal_error_result(self, message: str) -> dict[str, Any]:
+        return {
+            "internal_score": 0.0,
+            "safety_score": 0.0,
+            "comfort_score": 0.0,
+            "key_action_score": 0.0,
+            "progress_score": 0.0,
+            "no_at_fault_collisions": 1.0,
+            "drivable_area_compliance": 1.0,
+            "sample_valid": False,
+            "invalid_reason": message or None,
+            "first_no_nudge_upper_bound": None,
+            "overrun_no_nudge_gate": False,
+            "num_relevant_labeled": 0,
+            "num_key_actions": 0,
+            "num_key_actions_passed": 0,
+            "ego_front_max": 0.0,
+            "ego_rear_max": 0.0,
+            "raw_progress": 0.0,
+            "progress_norm": 0.0,
+            "progress_norm_source": "none",
             "error": message or None,
         }
 

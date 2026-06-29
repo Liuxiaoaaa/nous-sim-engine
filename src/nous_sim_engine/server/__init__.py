@@ -1,10 +1,15 @@
 from .app import app, create_app
 from .schemas import (
+    BatchInternalScoreRequest,
+    BatchInternalScoreResponse,
     BatchRLScoreRequest,
     BatchRLScoreResponse,
     BatchScoreRequest,
     BatchScoreResponse,
     HealthResponse,
+    InternalConfigOverrides,
+    InternalScoreRequest,
+    InternalScoreResponse,
     RLConfigOverrides,
     RLScoreRequest,
     RLScoreResponse,
@@ -24,5 +29,10 @@ __all__ = [
     "RLScoreResponse",
     "BatchRLScoreResponse",
     "RLConfigOverrides",
+    "InternalScoreRequest",
+    "BatchInternalScoreRequest",
+    "InternalScoreResponse",
+    "BatchInternalScoreResponse",
+    "InternalConfigOverrides",
     "HealthResponse",
 ]

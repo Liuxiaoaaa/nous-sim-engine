@@ -183,6 +183,69 @@ def test_internal_frame_builder_falls_back_to_raw_info_centerline():
     np.testing.assert_allclose(scene.centerline.discrete_path[-1], [20.0, 0.0], atol=1e-6)
 
 
+def test_internal_frame_builder_preserves_key_action_labels_from_raw_obstacles():
+    frame = {
+        "case_id": "case_with_key_action_labels",
+        "timestamp": "1.0",
+        "map": {},
+        "ego_car": {
+            "future_trajectory": [
+                {"x": 0.0, "y": 0.0},
+                {"x": 0.0, "y": 5.0},
+                {"x": 0.0, "y": 10.0},
+            ],
+        },
+        "obstacles": [
+            {
+                "id": 123,
+                "bbox_3d": [0.0, 10.0, 0.0, 4.0, 2.0, 1.5, 1.5 * np.pi],
+                "label": 1,
+                "sub_type": "CAR",
+            },
+            {
+                "id": 456,
+                "bbox_3d": [0.0, 20.0, 0.0, 4.0, 2.0, 1.5, 1.5 * np.pi],
+                "decision_label": "no_nudge",
+            },
+        ],
+    }
+    info_data = {
+        "ego_car_attribute": {
+            "position": [0.0, 0.0, 0.0],
+            "ego_heading": 0.0,
+            "pnc_local_routing": {
+                "routing_points": [
+                    {"x": 0.0, "y": 0.0, "z": 0.0},
+                    {"x": 20.0, "y": 0.0, "z": 0.0},
+                ]
+            },
+            "candidate_trajectory_point": [
+                {"x": 0.0, "y": 0.0},
+                {"x": 0.0, "y": 15.0},
+            ],
+        },
+        "lanes_info": [
+            {
+                "id": {"id": "lane_key_action"},
+                "leftBoundary": _raw_info_boundary([(0.0, 2.0), (20.0, 2.0)]),
+                "rightBoundary": _raw_info_boundary([(0.0, -2.0), (20.0, -2.0)]),
+            }
+        ],
+    }
+
+    scene = build_scene_context_from_frame(frame, info_data=info_data)
+
+    assert len(scene.key_action_obstacles) == 1
+    annotation = scene.key_action_obstacles[0]
+    assert annotation.token == "123"
+    assert annotation.label == 1
+    assert annotation.object_type == "agent"
+    np.testing.assert_allclose(annotation.polygon_coords.mean(axis=0), [10.0, 0.0], atol=1e-6)
+    assert scene.candidate_trajectory is not None
+    assert scene.candidate_progress == pytest.approx(15.0)
+    assert scene.gt_progress == pytest.approx(10.0)
+
+
 def test_internal_frame_builder_keeps_stationary_gt_repeated_points():
     frame = {
         "case_id": "case_with_stationary_future",

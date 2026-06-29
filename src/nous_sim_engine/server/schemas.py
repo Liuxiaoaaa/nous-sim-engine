@@ -4,7 +4,7 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel
 
-from nous_sim_engine.core.types import RLScoringResult, ScoringResult
+from nous_sim_engine.core.types import InternalScoringResult, RLScoringResult, ScoringResult
 
 
 class ScoreRequest(BaseModel):
@@ -124,6 +124,91 @@ class BatchRLScoreRequest(BaseModel):
     scoring_mode: Literal["continuous", "discrete"] = "continuous"
     config_overrides: Optional[RLConfigOverrides] = None
     include_ego: bool = False
+
+
+# ── Internal Key-Action Scoring Schemas ────────────────────────────────────
+
+
+class InternalConfigOverrides(BaseModel):
+    follow_margin: Optional[float] = None
+    pass_margin: Optional[float] = None
+    s_min: Optional[float] = None
+    d_back: Optional[float] = None
+    interaction_corridor_half_width: Optional[float] = None
+    s_horizon_min: Optional[float] = None
+    w_key: Optional[float] = None
+    w_progress: Optional[float] = None
+    w_comfort: Optional[float] = None
+
+
+class InternalScoreRequest(BaseModel):
+    trajectory: List[List[float]]
+    scene_token: str
+    log_name: str
+    dataset: str
+    config_overrides: Optional[InternalConfigOverrides] = None
+    include_ego: bool = False
+
+
+class BatchInternalScoreRequest(BaseModel):
+    trajectories: List[List[List[float]]]
+    scene_token: str
+    log_name: str
+    dataset: str
+    config_overrides: Optional[InternalConfigOverrides] = None
+    include_ego: bool = False
+
+
+class InternalScoreResponse(BaseModel):
+    internal_score: float = 0.0
+    safety_score: float = 0.0
+    comfort_score: float = 0.0
+    key_action_score: float = 0.0
+    progress_score: float = 0.0
+    no_at_fault_collisions: float = 1.0
+    drivable_area_compliance: float = 1.0
+    sample_valid: bool = True
+    invalid_reason: str | None = None
+    first_no_nudge_upper_bound: float | None = None
+    overrun_no_nudge_gate: bool = False
+    num_relevant_labeled: int = 0
+    num_key_actions: int = 0
+    num_key_actions_passed: int = 0
+    ego_front_max: float = 0.0
+    ego_rear_max: float = 0.0
+    raw_progress: float = 0.0
+    progress_norm: float = 0.0
+    progress_norm_source: str = "none"
+    error: str | None = None
+
+    @classmethod
+    def from_result(cls, result: InternalScoringResult) -> "InternalScoreResponse":
+        return cls(
+            internal_score=float(result.internal_score),
+            safety_score=float(result.safety_score),
+            comfort_score=float(result.comfort_score),
+            key_action_score=float(result.key_action_score),
+            progress_score=float(result.progress_score),
+            no_at_fault_collisions=float(result.no_at_fault_collisions),
+            drivable_area_compliance=float(result.drivable_area_compliance),
+            sample_valid=bool(result.sample_valid),
+            invalid_reason=result.invalid_reason,
+            first_no_nudge_upper_bound=result.first_no_nudge_upper_bound,
+            overrun_no_nudge_gate=bool(result.overrun_no_nudge_gate),
+            num_relevant_labeled=int(result.num_relevant_labeled),
+            num_key_actions=int(result.num_key_actions),
+            num_key_actions_passed=int(result.num_key_actions_passed),
+            ego_front_max=_round2(result.ego_front_max),
+            ego_rear_max=_round2(result.ego_rear_max),
+            raw_progress=_round2(result.raw_progress),
+            progress_norm=_round2(result.progress_norm),
+            progress_norm_source=result.progress_norm_source,
+            error=result.error,
+        )
+
+
+class BatchInternalScoreResponse(BaseModel):
+    results: List[InternalScoreResponse]
 
 
 def _round2(value: float) -> float:

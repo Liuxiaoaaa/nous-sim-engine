@@ -18,7 +18,7 @@ from nous_sim_engine.client import SimEngineClient, SimEngineClientError
 from nous_sim_engine.core.enums import MultiMetricIndex
 from nous_sim_engine.core.scorer import PDMScorer, RLScorerConfig
 from nous_sim_engine.core.scoring import PDMScorerV1
-from nous_sim_engine.core.types import SceneContext
+from nous_sim_engine.core.types import KeyActionObstacle, SceneContext
 from nous_sim_engine.server.app import create_app
 
 
@@ -27,6 +27,33 @@ from nous_sim_engine.server.app import create_app
 DATASET = "test"
 LOG_NAME = "test_log"
 SCENE_TOKEN = "test_scene_001"
+
+
+def _key_action_box(center_x: float, center_y: float = 0.0) -> np.ndarray:
+    return np.asarray(
+        [
+            [center_x + 2.0, center_y + 1.0],
+            [center_x - 2.0, center_y + 1.0],
+            [center_x - 2.0, center_y - 1.0],
+            [center_x + 2.0, center_y - 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _internal_scene(scene: SceneContext) -> SceneContext:
+    copied = copy.deepcopy(scene)
+    copied.key_action_obstacles = [
+        KeyActionObstacle(
+            token="key_obstacle",
+            label=1,
+            polygon_coords=_key_action_box(12.0),
+            object_type="static",
+        )
+    ]
+    copied.candidate_progress = 25.0
+    copied.gt_progress = 10.0
+    return copied
 
 
 class _PatchedClient(SimEngineClient):
@@ -512,6 +539,75 @@ class TestClientRL:
         assert len(results) == 2
         assert results[0]["rl_score"] >= results[1]["rl_score"]
         assert results[0]["error"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5. Internal key-action scoring
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestInternalScoring:
+    def test_internal_score_endpoint(self, straight_road_scene, safe_trajectory):
+        scene = _internal_scene(straight_road_scene)
+        with patch("nous_sim_engine.server.app.load_scene_context", return_value=scene):
+            with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+                app = create_app()
+                with TestClient(app) as tc:
+                    resp = tc.post("/v1/score/internal/rl", json={
+                        "trajectory": safe_trajectory,
+                        "scene_token": SCENE_TOKEN,
+                        "log_name": LOG_NAME,
+                        "dataset": DATASET,
+                    })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["error"] is None
+        assert data["sample_valid"] is True
+        assert data["num_key_actions"] == 1
+        assert data["num_key_actions_passed"] == 1
+        assert data["key_action_score"] == pytest.approx(1.0)
+        assert data["progress_norm_source"] == "candidate+logged:candidate"
+        assert 0.0 <= data["internal_score"] <= 1.0
+
+    def test_internal_score_batch_endpoint(self, straight_road_scene, safe_trajectory, offroad_trajectory):
+        scene = _internal_scene(straight_road_scene)
+        with patch("nous_sim_engine.server.app.load_scene_context", return_value=scene):
+            with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+                app = create_app()
+                with TestClient(app) as tc:
+                    resp = tc.post("/v1/score/internal/rl/batch", json={
+                        "trajectories": [safe_trajectory, offroad_trajectory],
+                        "scene_token": SCENE_TOKEN,
+                        "log_name": LOG_NAME,
+                        "dataset": DATASET,
+                    })
+
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert len(results) == 2
+        assert results[0]["sample_valid"] is True
+        assert results[1]["sample_valid"] is True
+        assert results[0]["internal_score"] >= results[1]["internal_score"]
+
+    def test_client_score_internal_rl(self, straight_road_scene, safe_trajectory):
+        scene = _internal_scene(straight_road_scene)
+        with patch("nous_sim_engine.server.app.load_scene_context", return_value=scene):
+            with patch.dict("os.environ", {"SIM_ENGINE_DATASETS": f"test=/fake/cache"}):
+                app = create_app()
+                with TestClient(app) as tc:
+                    client = _PatchedClient(tc)
+                    score, result = client.score_internal_rl(
+                        trajectory=safe_trajectory,
+                        scene_token=SCENE_TOKEN,
+                        log_name=LOG_NAME,
+                        dataset=DATASET,
+                        trajectory_frame="nuplan",
+                    )
+
+        assert score == pytest.approx(result["internal_score"])
+        assert result["sample_valid"] is True
+        assert result["error"] is None
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. Schema validation

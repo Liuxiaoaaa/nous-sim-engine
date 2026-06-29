@@ -18,13 +18,21 @@ from nous_sim_engine.adapters.dataset_loader import (
     set_boost_cache_dir,
     warmup_boost_cache,
 )
-from nous_sim_engine.core.scoring import PDMScorerV1, PDMScorerV2, RLScorer
+from nous_sim_engine.core.scoring import (
+    InternalKeyActionScorer,
+    InternalKeyActionScorerConfig,
+    PDMScorerV1,
+    PDMScorerV2,
+    RLScorer,
+)
 from nous_sim_engine.core.scoring.base import RLScorerConfig
-from nous_sim_engine.core.types import RLScoringResult, ScoringResult
+from nous_sim_engine.core.types import InternalScoringResult, RLScoringResult, ScoringResult
 
 from .registry import DatasetRegistry
 from .schemas import (
     BatchControlScoreRequest,
+    BatchInternalScoreRequest,
+    BatchInternalScoreResponse,
     BatchRLScoreRequest,
     BatchRLScoreResponse,
     BatchScoreRequest,
@@ -33,6 +41,9 @@ from .schemas import (
     DatasetListResponse,
     DatasetRegisterRequest,
     HealthResponse,
+    InternalConfigOverrides,
+    InternalScoreRequest,
+    InternalScoreResponse,
     RLConfigOverrides,
     RLScoreRequest,
     RLScoreResponse,
@@ -51,6 +62,10 @@ def _rl_result_to_response(result: RLScoringResult) -> RLScoreResponse:
     return RLScoreResponse.from_result(result)
 
 
+def _internal_result_to_response(result: InternalScoringResult) -> InternalScoreResponse:
+    return InternalScoreResponse.from_result(result)
+
+
 def _error_result(message: str) -> ScoreResponse:
     return _result_to_response(ScoringResult(error=message))
 
@@ -65,6 +80,22 @@ def _rl_error_result(message: str) -> RLScoreResponse:
 
 def _rl_error_results(message: str, batch_size: int) -> BatchRLScoreResponse:
     return BatchRLScoreResponse(results=[_rl_error_result(message) for _ in range(batch_size)])
+
+
+def _internal_error_result(message: str) -> InternalScoreResponse:
+    return _internal_result_to_response(
+        InternalScoringResult(
+            sample_valid=False,
+            invalid_reason=message,
+            error=message,
+        )
+    )
+
+
+def _internal_error_results(message: str, batch_size: int) -> BatchInternalScoreResponse:
+    return BatchInternalScoreResponse(
+        results=[_internal_error_result(message) for _ in range(batch_size)]
+    )
 
 
 def _cache_stats() -> dict[str, int]:
@@ -88,6 +119,17 @@ def _build_rl_config(
         for field, value in overrides.model_dump(exclude_none=True).items():
             kwargs[field] = value
     return RLScorerConfig(**kwargs)
+
+
+def _build_internal_config(
+    overrides: InternalConfigOverrides | None,
+) -> InternalKeyActionScorerConfig:
+    base_config = InternalKeyActionScorerConfig()
+    kwargs: dict = asdict(base_config)
+    if overrides is not None:
+        for field, value in overrides.model_dump(exclude_none=True).items():
+            kwargs[field] = value
+    return InternalKeyActionScorerConfig(**kwargs)
 
 
 def _resolve_dataset(registry: DatasetRegistry, dataset: str) -> str:
@@ -188,6 +230,36 @@ def _score_batch_rl(
         return _rl_error_results(str(exc), batch_size=len(batch_trajectories))
 
 
+def _score_batch_internal(
+    trajectories: Sequence[Sequence[Sequence[float]]],
+    scene_token: str,
+    log_name: str,
+    metric_cache_dir: str,
+    internal_config: InternalKeyActionScorerConfig,
+    include_ego: bool = False,
+    scorer_internal: InternalKeyActionScorer | None = None,
+) -> BatchInternalScoreResponse:
+    batch_trajectories = list(trajectories)
+    try:
+        scene = load_scene_context(
+            cache_dir=metric_cache_dir,
+            log_name=log_name,
+            token=scene_token,
+        )
+        scorer = scorer_internal or InternalKeyActionScorer()
+        results = scorer.score_batch(
+            trajectories_xy=batch_trajectories,
+            scene=scene,
+            config=internal_config,
+            include_ego=include_ego,
+        )
+        return BatchInternalScoreResponse(
+            results=[_internal_result_to_response(r) for r in results]
+        )
+    except Exception as exc:
+        return _internal_error_results(str(exc), batch_size=len(batch_trajectories))
+
+
 def _init_registry() -> DatasetRegistry:
     """Initialize DatasetRegistry from environment variables."""
     registry = DatasetRegistry()
@@ -217,6 +289,7 @@ async def _lifespan(app: FastAPI):
     app.state.scorer_v1 = PDMScorerV1()
     app.state.scorer_v2 = PDMScorerV2()
     app.state.scorer_rl = RLScorer()
+    app.state.scorer_internal = InternalKeyActionScorer()
     app.state.registry = _init_registry()
 
     # Boost cache: background warmup if configured
@@ -336,6 +409,40 @@ def create_app() -> FastAPI:
             rl_config=rl_config,
             include_ego=payload.include_ego,
             scorer_rl=request.app.state.scorer_rl,
+        )
+        return batch_response.results[0]
+
+    # ── Internal Key-Action Scoring ────────────────────────────────────────
+
+    @app.post("/v1/score/internal/rl/batch", response_model=BatchInternalScoreResponse)
+    def score_internal_batch(
+        payload: BatchInternalScoreRequest,
+        request: Request,
+    ) -> BatchInternalScoreResponse:
+        cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
+        internal_config = _build_internal_config(payload.config_overrides)
+        return _score_batch_internal(
+            trajectories=payload.trajectories,
+            scene_token=payload.scene_token,
+            log_name=payload.log_name,
+            metric_cache_dir=cache_dir,
+            internal_config=internal_config,
+            include_ego=payload.include_ego,
+            scorer_internal=request.app.state.scorer_internal,
+        )
+
+    @app.post("/v1/score/internal/rl", response_model=InternalScoreResponse)
+    def score_internal(payload: InternalScoreRequest, request: Request) -> InternalScoreResponse:
+        cache_dir = _resolve_dataset(request.app.state.registry, payload.dataset)
+        internal_config = _build_internal_config(payload.config_overrides)
+        batch_response = _score_batch_internal(
+            trajectories=[payload.trajectory],
+            scene_token=payload.scene_token,
+            log_name=payload.log_name,
+            metric_cache_dir=cache_dir,
+            internal_config=internal_config,
+            include_ego=payload.include_ego,
+            scorer_internal=request.app.state.scorer_internal,
         )
         return batch_response.results[0]
 
